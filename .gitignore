@@ -1,0 +1,7 @@
+alerts.json
+serviceAccountKey.json
+devices.json
+network_log.csv
+outage_log.csv
+nicknames.json
+__pycache__/
