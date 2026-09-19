@@ -1,3 +1,56 @@
+"""
+Home Network Monitor
+--------------------
+Finds the devices on your home WiFi by "pinging" every address on the network,
+shows a live table, and keeps a diary of what happens.
+
+Features
+    - Live table of devices, with nicknames like "Mom's phone"
+    - Phone alerts (Telegram and/or Discord) when a device joins or leaves
+    - Internet outage log, with a guess at whether the problem is your home
+      or your internet provider
+    - Live web dashboard: open http://localhost:8080 in your browser
+    - Connection quality: packet loss and jitter, measured with a small burst of pings
+      each scan, to the internet and to your router
+    - Stranger alarm: approve the devices you recognize, and get an instant alert when
+      any other device joins your network
+    - Uptime and speed history: "this device was online 97% of the week", and how
+      the ping time (delay) changed over the last 24 hours
+
+Uses only Python's built-in tools, so there is nothing to install.
+
+Run it:
+    python home_network_monitor.py               (scan forever, every 30 seconds)
+    python home_network_monitor.py --once        (scan one time, then stop)
+    python home_network_monitor.py --interval 10 (scan every 10 seconds)
+    python home_network_monitor.py --network 192.168.1.0/24  (if auto-detect guesses wrong)
+    python home_network_monitor.py --router 192.168.1.254    (if your router is not the default guess)
+
+Connection quality options:
+    python home_network_monitor.py --quality-pings 20   (pings per burst, default 10; 0 turns it off)
+
+Stranger alarm (approve your own devices first, or every device counts as a stranger):
+    python home_network_monitor.py --approve                (go through the devices one by one)
+    python home_network_monitor.py --approve 192.168.1.23   (approve a single device)
+    python home_network_monitor.py --unapprove 192.168.1.23 (take a device off the list)
+
+Uptime and speed report in the terminal (dashboard shows the same, with charts):
+    python home_network_monitor.py --report
+    python home_network_monitor.py --keep-days 60   (keep 60 days of history, default is 30)
+
+Dashboard options:
+    python home_network_monitor.py --share       (also let phones on your WiFi open the dashboard)
+    python home_network_monitor.py --port 8081   (use a different port if 8080 is busy)
+    python home_network_monitor.py --no-dashboard  (turn the dashboard off)
+
+Give a device a nickname (use the IP address you see in the table):
+    python home_network_monitor.py --name 192.168.1.23 "Mom's phone"
+
+Set up and test phone alerts (see alerts.json):
+    python home_network_monitor.py --test-alert
+
+Stop it any time with Ctrl+C.
+"""
 
 import argparse
 import csv
@@ -28,6 +81,7 @@ APPROVED_FILE = "approved.json"     # the guest list for the stranger alarm (sav
 ALARM_COOLDOWN = 6 * 3600           # after a stranger alarm, wait this long before alarming about the same device again
 
 INTERNET_KEY = "__internet__"       # the name the internet goes by inside the history database
+ROUTER_KEY = "__router__"           # ...and the router
 BUCKET_SECONDS = 1800               # history charts use 30 minute blocks...
 BUCKET_COUNT = 48                   # ...and show 48 of them, which is the last 24 hours
 
@@ -76,8 +130,10 @@ def quick_ping(ip):
     ip = str(ip)
     if IS_WINDOWS:
         cmd = ["ping", "-n", "1", "-w", "1000", ip]
+    elif platform.system().lower() == "darwin":
+        cmd = ["ping", "-c", "1", "-W", "1000", ip]     # on a Mac, -W counts milliseconds
     else:
-        cmd = ["ping", "-c", "1", "-W", "1", ip]
+        cmd = ["ping", "-c", "1", "-W", "1", ip]        # on Linux, -W counts seconds
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=4)
@@ -129,6 +185,69 @@ def check_internet():
             if online:
                 return True, ms
     return False, None
+
+
+def parse_burst(output, count):
+    """
+    Read the text a ping burst printed and work out:
+      loss   = the percentage of pings that got no reply
+      jitter = how much the delay bounces around from one reply to the next
+               (the average gap between neighbouring replies, in milliseconds)
+    """
+    times = []
+    for line in output.splitlines():
+        if "ttl=" in line.lower():      # only real replies contain "TTL"
+            match = re.search(r"time[=<]\s*([\d.]+)\s*ms", line, re.IGNORECASE)
+            if match:
+                times.append(float(match.group(1)))
+    times = times[:count]
+    received = len(times)
+    jitter = None
+    if received >= 2:
+        gaps = [abs(b - a) for a, b in zip(times, times[1:])]
+        jitter = round(sum(gaps) / len(gaps), 2)
+    return {
+        "sent": count,
+        "received": received,
+        "loss": round(100.0 * (count - received) / count, 1),
+        "min": min(times) if times else None,
+        "avg": round(sum(times) / received, 2) if times else None,
+        "max": max(times) if times else None,
+        "jitter": jitter,
+    }
+
+
+def ping_burst(ip, count):
+    """
+    Send a small burst of pings to one address and measure the quality of the connection,
+    not just whether it is up. Returns a dictionary (see parse_burst), or None if the
+    ping command could not be run.
+    """
+    ip = str(ip)
+    system = platform.system().lower()
+    if IS_WINDOWS:
+        cmd = ["ping", "-n", str(count), "-w", "1000", ip]         # Windows sends one ping per second
+    elif system == "darwin":
+        cmd = ["ping", "-c", str(count), "-W", "1000", ip]
+    else:
+        cmd = ["ping", "-c", str(count), "-i", "0.2", "-W", "1", ip]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=count * 2 + 10)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    return parse_burst(result.stdout, count)
+
+
+def quality_verdict(loss, jitter):
+    """A plain-words rating. Rough rules of thumb for real-time things like video calls and games."""
+    if loss is None:
+        return "no data yet"
+    jitter = jitter if jitter is not None else 0
+    if loss <= 1 and jitter <= 20:
+        return "Good"
+    if loss <= 3 and jitter <= 50:
+        return "Fair"
+    return "Poor"
 
 
 # ---------------------------------------------------------------------------
@@ -627,7 +746,7 @@ def update_devices(known, results, arp_table, nicknames, my_ip, miss_limit, aler
 
 
 def show_table(known, my_ip, network, round_number, nicknames, warnings,
-               internet_text, router, alerts_text, dashboard_text, approved):
+               internet_text, router, alerts_text, dashboard_text, approved, quality_text):
     os.system("cls" if IS_WINDOWS else "clear")
     online_count = sum(1 for d in known.values() if d["online"])
     width = 98
@@ -635,6 +754,7 @@ def show_table(known, my_ip, network, round_number, nicknames, warnings,
     print(f"Scan #{round_number} at {datetime.now().strftime('%H:%M:%S')}   "
           f"online: {online_count}   ever seen: {len(known)}")
     print(f"Internet: {internet_text}")
+    print(f"Quality: {quality_text}")
     print(f"Alerts: {alerts_text}")
     if approved is None:
         print("Stranger alarm: off (run  python home_network_monitor.py --approve  to turn it on)")
@@ -683,6 +803,9 @@ def open_history():
     conn.execute("CREATE TABLE IF NOT EXISTS samples (ts INTEGER, key TEXT, online INTEGER, ms REAL)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_samples_key_ts ON samples (key, ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples (ts)")
+    conn.execute("CREATE TABLE IF NOT EXISTS quality "
+                 "(ts INTEGER, key TEXT, sent INTEGER, received INTEGER, avg_ms REAL, max_ms REAL, jitter REAL)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_quality_key_ts ON quality (key, ts)")
     conn.commit()
     return conn
 
@@ -721,7 +844,69 @@ def prune_history(conn, keep_days):
     """Delete samples older than keep_days, so the file does not grow forever."""
     cutoff = int(time.time()) - keep_days * 86400
     conn.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
+    conn.execute("DELETE FROM quality WHERE ts < ?", (cutoff,))
     conn.commit()
+
+
+def record_quality(conn, ts, quality):
+    """Save this scan's ping bursts. 'quality' maps INTERNET_KEY and ROUTER_KEY to results (or None)."""
+    try:
+        rows = [(ts, key, b["sent"], b["received"], b["avg"], b["max"], b["jitter"])
+                for key, b in quality.items() if b]
+        if rows:
+            conn.executemany("INSERT INTO quality VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+            conn.commit()
+        return ""
+    except sqlite3.Error:
+        return "Warning: history.db could not be written this scan."
+
+
+def quality_stats(conn, now_ts):
+    """
+    For the internet and the router: packet loss, jitter and ping over the last 24 hours,
+    a rating based on the last hour, and 48 half-hour blocks for the charts.
+    Each block is [loss_percent, jitter_ms, average_ping_ms], with None where there is no data.
+    """
+    day_start = now_ts - 86400
+    hour_start = now_ts - 3600
+    stats = {}
+
+    def get(key):
+        if key not in stats:
+            stats[key] = {"loss_24h": None, "jitter_24h": None, "avg_ms": None, "max_ms": None,
+                          "bursts_24h": 0, "verdict": "no recent data",
+                          "buckets": [[None, None, None] for _ in range(BUCKET_COUNT)]}
+        return stats[key]
+
+    def loss_of(sent, received):
+        return round(100.0 * (sent - received) / sent, 2) if sent else None
+
+    for key, n, sent, received, jitter, max_ms, weighted, weight in conn.execute(
+            "SELECT key, COUNT(*), SUM(sent), SUM(received), AVG(jitter), MAX(max_ms), "
+            "SUM(avg_ms * received), SUM(CASE WHEN avg_ms IS NOT NULL THEN received END) "
+            "FROM quality WHERE ts >= ? GROUP BY key", (day_start,)):
+        entry = get(key)
+        entry["bursts_24h"] = n
+        entry["loss_24h"] = loss_of(sent, received)
+        entry["jitter_24h"] = round(jitter, 1) if jitter is not None else None
+        entry["max_ms"] = round(max_ms, 1) if max_ms is not None else None
+        entry["avg_ms"] = round(weighted / weight, 1) if weight else None
+
+    # The rating looks at the last hour only, so it says how the connection is doing right now.
+    for key, sent, received, jitter in conn.execute(
+            "SELECT key, SUM(sent), SUM(received), AVG(jitter) FROM quality WHERE ts >= ? GROUP BY key",
+            (hour_start,)):
+        get(key)["verdict"] = quality_verdict(loss_of(sent, received), jitter)
+
+    for key, b, sent, received, jitter, avg_ms in conn.execute(
+            "SELECT key, CAST((? - ts) / ? AS INTEGER) AS b, SUM(sent), SUM(received), AVG(jitter), AVG(avg_ms) "
+            "FROM quality WHERE ts >= ? GROUP BY key, b", (now_ts, BUCKET_SECONDS, day_start)):
+        index = BUCKET_COUNT - 1 - b
+        if 0 <= index < BUCKET_COUNT:
+            get(key)["buckets"][index] = [loss_of(sent, received),
+                                          round(jitter, 1) if jitter is not None else None,
+                                          round(avg_ms, 1) if avg_ms is not None else None]
+    return stats
 
 
 def history_since(conn):
@@ -800,6 +985,7 @@ def run_report():
         conn = open_history()
         now_ts = int(time.time())
         stats = history_stats(conn, now_ts)
+        qstats = quality_stats(conn, now_ts)
         since_ts = history_since(conn)
         conn.close()
     except sqlite3.Error:
@@ -846,6 +1032,23 @@ def run_report():
         else:
             print(f"{name[:21]:<22}{ip:<16}{pct(st['uptime_24h']):<12}{pct(st['uptime_7d']):<12}"
                   f"{ms(st['avg_ms']):<11}{ms(st['max_ms']):<11}{st['samples_7d']}")
+    print("-" * 88)
+
+    print("\nCONNECTION QUALITY (last 24 hours)")
+    print("Loss = pings that got no reply. Jitter = how much the delay bounces around. "
+          "The rating looks at the last hour.")
+    print("-" * 88)
+    print(f"{'TO':<22}{'LOSS':<10}{'JITTER':<10}{'AVG PING':<11}{'MAX PING':<11}{'RATING NOW':<14}{'BURSTS'}")
+    print("-" * 88)
+    for label, key in (("Internet (8.8.8.8)", INTERNET_KEY), ("Router", ROUTER_KEY)):
+        q = qstats.get(key)
+        if q is None:
+            print(f"{label:<22}no data yet")
+            continue
+        loss = "-" if q["loss_24h"] is None else f"{q['loss_24h']:.1f}%"
+        jit = "-" if q["jitter_24h"] is None else f"{q['jitter_24h']:.1f} ms"
+        print(f"{label:<22}{loss:<10}{jit:<10}{ms(q['avg_ms']):<11}{ms(q['max_ms']):<11}"
+              f"{q['verdict']:<14}{q['bursts_24h']}")
     print("-" * 88)
 
 
@@ -911,6 +1114,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   ul.list li.empty { color:var(--muted); }
   .badge { margin-left:8px; padding:1px 8px; border-radius:999px; font-size:11px; font-weight:600;
            background:#3d1f1f; color:var(--red); border:1px solid var(--red); vertical-align:1px; }
+  .pill { display:inline-block; padding:1px 9px; border-radius:999px; font-size:12px; font-weight:600; margin-bottom:2px; }
+  .pill.good { background:#12301a; color:var(--green); border:1px solid var(--green); }
+  .pill.fair { background:#3a2f12; color:var(--amber); border:1px solid var(--amber); }
+  .pill.poor { background:#3d1f1f; color:var(--red); border:1px solid var(--red); }
+  .pill.none { background:transparent; color:var(--muted); border:1px solid var(--line); }
+  .cap { color:var(--muted); font-size:11px; margin-top:3px; }
   .hnote { color:var(--muted); font-size:13px; margin:-4px 0 6px; }
   .hrow { display:grid; grid-template-columns:minmax(110px,0.8fr) minmax(220px,2fr) minmax(120px,1fr) 205px;
           gap:12px; align-items:center; padding:10px 0; border-bottom:1px solid var(--line); }
@@ -950,11 +1159,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="note-text" id="stat-total"></div></div>
     <div class="card"><div class="label">Internet</div><div class="value" id="stat-internet">-</div>
       <div class="note-text" id="stat-internet-note"></div></div>
+    <div class="card"><div class="label">Connection quality</div><div class="value small" id="stat-quality">-</div>
+      <div class="note-text" id="stat-quality-note"></div></div>
     <div class="card"><div class="label">Stranger alarm</div><div class="value small" id="stat-stranger">-</div>
       <div class="note-text" id="stat-stranger-note"></div></div>
     <div class="card"><div class="label">Phone alerts</div><div class="value small" id="stat-alerts">-</div></div>
-    <div class="card"><div class="label">Scan speed</div><div class="value small" id="stat-scan">-</div>
-      <div class="note-text" id="stat-scan-note"></div></div>
   </section>
 
   <section class="panel">
@@ -964,6 +1173,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <thead><tr><th>Status</th><th>Nickname</th><th>IP address</th><th>Ping</th><th>MAC address</th><th>Device name</th><th>Last seen</th></tr></thead>
         <tbody id="devices"></tbody>
       </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Connection quality (last 24 hours)</h2>
+    <div class="hnote" id="quality-note">Collecting data...</div>
+    <div id="quality"></div>
+    <div class="legend">
+      <span><i class="b-good"></i>1% lost or less</span>
+      <span><i class="b-part"></i>1 to 3% lost</span>
+      <span><i class="b-bad"></i>more than 3% lost</span>
+      <span><i class="b-none"></i>no data</span>
+      <span>Loss = test pings that got no reply. Jitter = how much the delay bounces around. Each block is 30 minutes.</span>
     </div>
   </section>
 
@@ -1107,10 +1329,10 @@ function strip(h, nowTs) {
 }
 
 // A small line chart of the average ping in each half hour. Gaps mean the device did not answer.
-function sparkline(h) {
+function sparkline(h, emptyText) {
   const values = h ? h.buckets.map((b) => b[1]) : [];
   const numbers = values.filter((v) => v !== null && v !== undefined);
-  if (numbers.length < 2) return el("div", "Not enough ping data yet", "spark-empty");
+  if (numbers.length < 2) return el("div", emptyText || "Not enough ping data yet", "spark-empty");
   const top = Math.max(...numbers, 1);
   let d = "";
   let drawing = false;
@@ -1169,9 +1391,95 @@ function renderHistory(s) {
     : "Collecting data...";
 }
 
+// The connection quality rows: lost pings per half hour, and jitter over time.
+function lossStrip(q, nowTs) {
+  const wrap = el("div", null, "strip");
+  for (let i = 0; i < 48; i++) {
+    const b = q ? q.buckets[i] : [null, null, null];
+    const block = el("span");
+    let cls = "b-none", tip = "No data";
+    if (b[0] !== null) {
+      cls = b[0] <= 1 ? "b-good" : (b[0] <= 3 ? "b-part" : "b-bad");
+      tip = b[0] + "% lost";
+      if (b[1] !== null) tip += ", jitter " + Math.round(b[1]) + " ms";
+      if (b[2] !== null) tip += ", average ping " + Math.round(b[2]) + " ms";
+    }
+    block.className = cls;
+    const start = new Date((nowTs - (48 - i) * 1800) * 1000);
+    block.title = start.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + ": " + tip;
+    wrap.appendChild(block);
+  }
+  return wrap;
+}
+
+function pillClass(verdict) {
+  return verdict === "Good" ? "good" : verdict === "Fair" ? "fair" : verdict === "Poor" ? "poor" : "none";
+}
+
+function qualityRow(title, sub, q, nowTs) {
+  const row = el("div", null, "hrow");
+  const who = el("div");
+  who.appendChild(el("div", title, "who-name"));
+  who.appendChild(el("div", sub, "who-sub"));
+  row.appendChild(who);
+
+  const strip = el("div");
+  strip.appendChild(lossStrip(q, nowTs));
+  strip.appendChild(el("div", "Lost pings", "cap"));
+  row.appendChild(strip);
+
+  const spark = el("div");
+  spark.appendChild(sparkline(q ? { buckets: q.buckets.map((b) => [null, b[1]]) } : null, "Not enough jitter data yet"));
+  spark.appendChild(el("div", "Jitter", "cap"));
+  row.appendChild(spark);
+
+  const stats = el("div", null, "hstats");
+  if (!q) {
+    stats.appendChild(el("div", "No data yet"));
+  } else {
+    stats.appendChild(el("span", "Right now: " + q.verdict, "pill " + pillClass(q.verdict)));
+    stats.appendChild(el("div", "Loss " + (q.loss_24h === null ? "-" : q.loss_24h + "%") +
+      "   Jitter " + (q.jitter_24h === null ? "-" : q.jitter_24h + " ms")));
+    stats.appendChild(el("div", "Ping  avg " + msText(q.avg_ms) + "   max " + msText(q.max_ms)));
+  }
+  row.appendChild(stats);
+  return row;
+}
+
+function renderQuality(s) {
+  const box = $("quality");
+  clear(box);
+  const quality = s.quality;
+  const card = $("stat-quality");
+  if (!quality.enabled) {
+    card.textContent = "Off";
+    card.className = "value small";
+    $("stat-quality-note").textContent = "Use --quality-pings 10 to turn it on";
+    box.appendChild(el("div", "Connection quality testing is switched off.", "spark-empty"));
+    $("quality-note").textContent = "";
+    return;
+  }
+  box.appendChild(qualityRow("Internet", "to 8.8.8.8", quality.internet, s.now_ts));
+  box.appendChild(qualityRow("Router", "your WiFi and home network", quality.router, s.now_ts));
+  $("quality-note").textContent = "Each scan sends a small burst of test pings to the internet and to your router. "
+    + "If only the internet row looks bad, the problem is probably your provider. If the router row looks bad too, look at your WiFi.";
+
+  const q = quality.internet;
+  if (q) {
+    card.textContent = q.verdict;
+    card.className = "value small " + (q.verdict === "Good" ? "t-good" : q.verdict === "Fair" ? "t-warn" : q.verdict === "Poor" ? "t-bad" : "");
+    $("stat-quality-note").textContent = "Internet, right now. Last 24h: " + (q.loss_24h === null ? "-" : q.loss_24h + "% lost")
+      + ", jitter " + (q.jitter_24h === null ? "-" : q.jitter_24h + " ms");
+  } else {
+    card.textContent = "Measuring...";
+    card.className = "value small";
+    $("stat-quality-note").textContent = "";
+  }
+}
+
 function render(s) {
   $("network").textContent = "Network " + s.network + "  |  router " + s.router + "  |  this PC " + s.my_ip;
-  $("updated").textContent = "Updated " + s.updated + " (scan #" + s.scan + ")";
+  $("updated").textContent = "Updated " + s.updated + " (scan #" + s.scan + ", every " + s.interval + " s)";
 
   const online = s.devices.filter((d) => d.status !== "offline").length;
   $("stat-online").textContent = online;
@@ -1208,8 +1516,6 @@ function render(s) {
   }
 
   $("stat-alerts").textContent = s.alerts;
-  $("stat-scan").textContent = "Every " + s.interval + " seconds";
-  $("stat-scan-note").textContent = "Scan #" + s.scan;
 
   const warnings = $("warnings");
   clear(warnings);
@@ -1223,6 +1529,7 @@ function render(s) {
   renderDevices(s.devices);
   renderEvents(s.events);
   renderOutages(s.outages);
+  renderQuality(s);
   renderHistory(s);
 }
 
@@ -1256,7 +1563,7 @@ def read_csv_tail(path, count):
 
 
 def publish_dashboard(known, nicknames, my_ip, network, router, round_number,
-                      interval, internet, alerts_text, warnings, stats, since_ts, now_ts, approved):
+                      interval, internet, alerts_text, warnings, stats, since_ts, now_ts, approved, quality):
     """Package the latest scan as JSON. The web page fetches this every few seconds."""
     devices = []
     for ip, d in known.items():
@@ -1297,6 +1604,7 @@ def publish_dashboard(known, nicknames, my_ip, network, router, round_number,
         "now_ts": now_ts,
         "history_since": datetime.fromtimestamp(since_ts).strftime("%Y-%m-%d %H:%M:%S") if since_ts else None,
         "internet_history": stats.get(INTERNET_KEY),
+        "quality": quality,
         "stranger": {"active": approved is not None,
                      "approved_count": len(approved) if approved is not None else 0,
                      "unknown_online": unknown_online},
@@ -1362,6 +1670,8 @@ def main():
                         help="stranger alarm: go through devices one by one, or approve the given IPs")
     parser.add_argument("--unapprove", nargs="+", metavar="IP",
                         help="stranger alarm: take devices off the approved list")
+    parser.add_argument("--quality-pings", type=int, default=10,
+                        help="pings per connection quality test each scan (default 10, 0 turns it off)")
     parser.add_argument("--keep-days", type=int, default=30,
                         help="days of history to keep (default 30)")
     parser.add_argument("--report", action="store_true",
@@ -1413,6 +1723,7 @@ def main():
         history_problem = "Warning: history.db could not be opened, so uptime history is off."
     last_prune = time.time()
     alarm_times = {}    # when each unapproved device last set off the alarm, so we do not repeat ourselves
+    burst_pool = ThreadPoolExecutor(max_workers=2)   # runs the quality tests while the sweep is running
 
     if args.no_dashboard or args.once:
         dashboard_text = "off"
@@ -1430,7 +1741,13 @@ def main():
         while True:
             round_number += 1
             baseline = round_number == 1
+            # Start the connection quality tests first. They run at the same time as the sweep.
+            bursts = {}
+            if args.quality_pings > 0:
+                bursts = {INTERNET_KEY: burst_pool.submit(ping_burst, INTERNET_TARGETS[0], args.quality_pings),
+                          ROUTER_KEY: burst_pool.submit(ping_burst, router, args.quality_pings)}
             results = sweep(network)
+            quality = {key: future.result() for key, future in bursts.items()}
             arp_table = read_arp_table()
             nicknames, nickname_problem = load_nicknames()   # re-read each scan, so edits apply live
             alerter.reload()
@@ -1474,7 +1791,8 @@ def main():
             # save the internet result, but not the devices, so they are not counted as down.
             now_ts = int(time.time())
             if history is not None:
-                history_problem = record_history(history, now_ts, known, internet_up, internet_ms, trusted)
+                history_problem = (record_history(history, now_ts, known, internet_up, internet_ms, trusted)
+                                   or record_quality(history, now_ts, quality))
                 if time.time() - last_prune > 86400:
                     try:
                         prune_history(history, args.keep_days)
@@ -1496,23 +1814,38 @@ def main():
             warnings = [w for w in (nickname_problem, approved_problem, alerter.file_problem,
                                     alerter.send_problem, history_problem) if w]
 
-            stats, since_ts = {}, None
+            stats, qstats, since_ts = {}, {}, None
             if history is not None:
                 try:
                     stats = history_stats(history, now_ts)
+                    qstats = quality_stats(history, now_ts)
                     since_ts = history_since(history)
                 except sqlite3.Error:
                     pass
+            quality_snapshot = {"enabled": args.quality_pings > 0,
+                                "internet": qstats.get(INTERNET_KEY), "router": qstats.get(ROUTER_KEY)}
+
+            def burst_text(key, name):
+                b = quality.get(key)
+                if not b:
+                    return f"{name}: not measured"
+                jitter = "-" if b["jitter"] is None else f"{b['jitter']:.0f} ms"
+                return f"{name}: {b['loss']:.0f}% lost, jitter {jitter}"
+            if args.quality_pings > 0:
+                quality_text = (burst_text(INTERNET_KEY, "internet") + "   |   "
+                                + burst_text(ROUTER_KEY, "router") + "   (latest test)")
+            else:
+                quality_text = "off (use --quality-pings 10 to turn it on)"
 
             internet = {"up": internet_up, "ms": internet_ms,
                         "since": outage["start"].strftime("%H:%M:%S") if outage else None,
                         "cause": outage["cause"] if outage else None}
             publish_dashboard(known, nicknames, my_ip, network, router, round_number,
                               args.interval, internet, alerter.channels_text(), warnings,
-                              stats, since_ts, now_ts, approved)
+                              stats, since_ts, now_ts, approved, quality_snapshot)
 
             show_table(known, my_ip, network, round_number, nicknames, warnings,
-                       internet_text, router, alerter.channels_text(), dashboard_text, approved)
+                       internet_text, router, alerter.channels_text(), dashboard_text, approved, quality_text)
 
             with open(STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(known, f, indent=2)
@@ -1524,6 +1857,7 @@ def main():
     except KeyboardInterrupt:
         print("\nStopped. Your logs are in", LOG_FILE, "and", OUTAGE_FILE)
     finally:
+        burst_pool.shutdown(wait=False)
         if history is not None:
             history.close()
 
