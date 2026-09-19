@@ -4,4 +4,5 @@ devices.json
 network_log.csv
 outage_log.csv
 nicknames.json
+history.db
 __pycache__/

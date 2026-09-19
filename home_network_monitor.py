@@ -10,6 +10,8 @@ Features
     - Internet outage log, with a guess at whether the problem is your home
       or your internet provider
     - Live web dashboard: open http://localhost:8080 in your browser
+    - Uptime and speed history: "this device was online 97% of the week", and how
+      the ping time (delay) changed over the last 24 hours
 
 Uses only Python's built-in tools, so there is nothing to install.
 
@@ -19,6 +21,10 @@ Run it:
     python home_network_monitor.py --interval 10 (scan every 10 seconds)
     python home_network_monitor.py --network 192.168.1.0/24  (if auto-detect guesses wrong)
     python home_network_monitor.py --router 192.168.1.254    (if your router is not the default guess)
+
+Uptime and speed report in the terminal (dashboard shows the same, with charts):
+    python home_network_monitor.py --report
+    python home_network_monitor.py --keep-days 60   (keep 60 days of history, default is 30)
 
 Dashboard options:
     python home_network_monitor.py --share       (also let phones on your WiFi open the dashboard)
@@ -42,6 +48,7 @@ import os
 import platform
 import re
 import socket
+import sqlite3
 import subprocess
 import threading
 import time
@@ -57,6 +64,11 @@ OUTAGE_FILE = "outage_log.csv"      # one line per internet outage: start, end, 
 STATE_FILE = "devices.json"         # the latest snapshot of every device seen so far
 NICKNAME_FILE = "nicknames.json"    # your name tags, saved by MAC address
 ALERT_FILE = "alerts.json"          # your alert settings (this file holds secrets, keep it private)
+HISTORY_FILE = "history.db"         # every scan, saved for uptime and speed history
+
+INTERNET_KEY = "__internet__"       # the name the internet goes by inside the history database
+BUCKET_SECONDS = 1800               # history charts use 30 minute blocks...
+BUCKET_COUNT = 48                   # ...and show 48 of them, which is the last 24 hours
 
 INTERNET_TARGETS = ["8.8.8.8", "1.1.1.1"]   # well-known public servers we knock on to test the internet
 
@@ -528,6 +540,187 @@ def show_table(known, my_ip, network, round_number, nicknames, warnings,
 
 
 # ---------------------------------------------------------------------------
+# History (uptime and speed)
+# Every scan is saved in a small database file (SQLite, which comes with Python).
+# From it we can work out "this device was online 97% of the week" and chart how
+# the ping time (latency, which just means delay) changes over time.
+#
+# A note on honesty: uptime only counts the time this monitor was running. If your
+# computer was off for a day, that day is not counted as "down" for anything.
+# ---------------------------------------------------------------------------
+
+def open_history():
+    conn = sqlite3.connect(HISTORY_FILE, timeout=10)
+    conn.execute("CREATE TABLE IF NOT EXISTS samples (ts INTEGER, key TEXT, online INTEGER, ms REAL)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_samples_key_ts ON samples (key, ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples (ts)")
+    conn.commit()
+    return conn
+
+
+def device_key(ip, entry):
+    """What a device is filed under in the history: its MAC address if we know it, else its IP."""
+    return entry.get("mac") or ip
+
+
+def record_history(conn, ts, known, internet_up, internet_ms, save_devices):
+    """
+    Save one row per device (and one for the internet) for this scan.
+    Returns "" if all went well, or a short warning if the database could not be written.
+    """
+    try:
+        rows = [(ts, INTERNET_KEY, 1 if internet_up else 0, internet_ms)]
+        if save_devices:
+            # If a device changed IP address, we know it under two entries but it is one device.
+            # Keep the online one, so it is not counted as both up and down at once.
+            by_key = {}
+            for ip, d in known.items():
+                online = 1 if d["online"] else 0
+                ms = d["ms"] if d["online"] else None
+                key = device_key(ip, d)
+                if key not in by_key or online > by_key[key][0]:
+                    by_key[key] = (online, ms)
+            rows += [(ts, key, online, ms) for key, (online, ms) in by_key.items()]
+        conn.executemany("INSERT INTO samples VALUES (?, ?, ?, ?)", rows)
+        conn.commit()
+        return ""
+    except sqlite3.Error:
+        return "Warning: history.db could not be written this scan."
+
+
+def prune_history(conn, keep_days):
+    """Delete samples older than keep_days, so the file does not grow forever."""
+    cutoff = int(time.time()) - keep_days * 86400
+    conn.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
+    conn.commit()
+
+
+def history_since(conn):
+    """When the oldest saved sample was taken (as a timestamp), or None if there is none."""
+    row = conn.execute("SELECT MIN(ts) FROM samples").fetchone()
+    return row[0] if row else None
+
+
+def history_stats(conn, now_ts):
+    """
+    Work out, for every device (and the internet): uptime over 24 hours and 7 days,
+    average and worst ping over 24 hours, and 48 half-hour blocks for the charts.
+    Each block is [fraction_online, average_ping_ms], with None where there is no data.
+    """
+    day_start = now_ts - 86400
+    week_start = now_ts - 7 * 86400
+    stats = {}
+
+    def get(key):
+        if key not in stats:
+            stats[key] = {"uptime_24h": None, "uptime_7d": None, "avg_ms": None, "max_ms": None,
+                          "samples_7d": 0, "buckets": [[None, None] for _ in range(BUCKET_COUNT)]}
+        return stats[key]
+
+    for key, n, ups in conn.execute(
+            "SELECT key, COUNT(*), SUM(online) FROM samples WHERE ts >= ? GROUP BY key", (week_start,)):
+        entry = get(key)
+        entry["uptime_7d"] = round(100.0 * ups / n, 2)
+        entry["samples_7d"] = n
+
+    for key, n, ups, avg_ms, max_ms in conn.execute(
+            "SELECT key, COUNT(*), SUM(online), AVG(ms), MAX(ms) FROM samples WHERE ts >= ? GROUP BY key",
+            (day_start,)):
+        entry = get(key)
+        entry["uptime_24h"] = round(100.0 * ups / n, 2)
+        entry["avg_ms"] = round(avg_ms, 1) if avg_ms is not None else None
+        entry["max_ms"] = round(max_ms, 1) if max_ms is not None else None
+
+    # Bucket 0 is the newest half hour. We store them oldest first, so the chart reads left to right.
+    for key, b, n, ups, avg_ms in conn.execute(
+            "SELECT key, CAST((? - ts) / ? AS INTEGER) AS b, COUNT(*), SUM(online), AVG(ms) "
+            "FROM samples WHERE ts >= ? GROUP BY key, b", (now_ts, BUCKET_SECONDS, day_start)):
+        index = BUCKET_COUNT - 1 - b
+        if 0 <= index < BUCKET_COUNT:
+            get(key)["buckets"][index] = [round(ups / n, 3),
+                                          round(avg_ms, 1) if avg_ms is not None else None]
+    return stats
+
+
+def load_known():
+    """
+    Remember the devices from earlier runs (devices.json), as 'offline until seen again'.
+    Without this, a device that was away when you restarted the monitor would not be
+    tracked, and its time away would be missing from the uptime figures.
+    """
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    known = {}
+    for ip, d in data.items():
+        if isinstance(d, dict):
+            known[ip] = {"first_seen": d.get("first_seen", ""), "online": False, "misses": 0,
+                         "ms": None, "name": d.get("name", ""), "mac": d.get("mac", ""),
+                         "last_seen": d.get("last_seen", "")}
+    return known
+
+
+def run_report():
+    """Handles:  --report   (prints the uptime and speed numbers in the terminal)"""
+    if not os.path.exists(HISTORY_FILE):
+        print("No history yet. Run the monitor for a while first, then try again.")
+        return
+    try:
+        conn = open_history()
+        now_ts = int(time.time())
+        stats = history_stats(conn, now_ts)
+        since_ts = history_since(conn)
+        conn.close()
+    except sqlite3.Error:
+        print("Could not read history.db. Try again in a moment.")
+        return
+
+    known = load_known()
+    nicknames, _ = load_nicknames()
+    try:
+        my_ip = get_my_network()[1]
+    except OSError:
+        my_ip = ""
+
+    def pct(v):
+        return "-" if v is None else f"{v:.1f}%"
+
+    def ms(v):
+        return "-" if v is None else f"{v:.0f} ms"
+
+    print("UPTIME AND SPEED REPORT")
+    if since_ts:
+        print(f"Tracking since {datetime.fromtimestamp(since_ts):%Y-%m-%d %H:%M} "
+              f"({format_duration(now_ts - since_ts)} of data)")
+    print("Uptime only counts the time the monitor was running.")
+    print("-" * 88)
+    print(f"{'DEVICE':<22}{'IP ADDRESS':<16}{'UPTIME 24H':<12}{'UPTIME 7D':<12}"
+          f"{'AVG PING':<11}{'MAX PING':<11}{'SCANS'}")
+    print("-" * 88)
+
+    rows = [("Internet", "-", stats.get(INTERNET_KEY))]
+    seen = set()
+    for ip in sorted(known, key=sort_key):
+        d = known[ip]
+        key = device_key(ip, d)
+        if key in seen:
+            continue
+        seen.add(key)
+        name = find_nickname(ip, d.get("mac"), nicknames, my_ip) or d.get("name") or "Unknown device"
+        rows.append((name, ip, stats.get(key)))
+
+    for name, ip, st in rows:
+        if st is None:
+            print(f"{name[:21]:<22}{ip:<16}no data yet")
+        else:
+            print(f"{name[:21]:<22}{ip:<16}{pct(st['uptime_24h']):<12}{pct(st['uptime_7d']):<12}"
+                  f"{ms(st['avg_ms']):<11}{ms(st['max_ms']):<11}{st['samples_7d']}")
+    print("-" * 88)
+
+
+# ---------------------------------------------------------------------------
 # Live dashboard
 # The monitor also runs a tiny web server. Open http://localhost:8080 in your
 # browser and you get a live page with the same information as the table.
@@ -587,6 +780,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   ul.list li:last-child { border-bottom:0; }
   ul.list .when { color:var(--muted); min-width:92px; font-variant-numeric:tabular-nums; }
   ul.list li.empty { color:var(--muted); }
+  .hnote { color:var(--muted); font-size:13px; margin:-4px 0 6px; }
+  .hrow { display:grid; grid-template-columns:minmax(110px,0.8fr) minmax(220px,2fr) minmax(120px,1fr) 205px;
+          gap:12px; align-items:center; padding:10px 0; border-bottom:1px solid var(--line); }
+  .hrow:last-child { border-bottom:0; }
+  .who-name { font-weight:600; }
+  .who-sub { color:var(--muted); font-size:12px; }
+  .strip { display:flex; gap:1px; height:20px; }
+  .strip span { flex:1; border-radius:2px; }
+  .b-good { background:var(--green); } .b-part { background:var(--amber); }
+  .b-bad { background:var(--red); } .b-none { background:#2a323c; }
+  .spark { width:100%; height:36px; display:block; }
+  .spark path { stroke:#58a6ff; stroke-width:1.5; fill:none; vector-effect:non-scaling-stroke;
+                stroke-linecap:round; stroke-linejoin:round; }
+  .spark-empty { color:var(--muted); font-size:12px; }
+  .hstats { font-size:13px; color:var(--muted); line-height:1.6; white-space:nowrap; }
+  .legend { display:flex; gap:14px; flex-wrap:wrap; color:var(--muted); font-size:12px; margin-top:10px; }
+  .legend i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:-1px; }
+  @media (max-width:760px) { .hrow { grid-template-columns:1fr; gap:6px; } }
   footer { color:var(--muted); font-size:12px; margin-top:16px; text-align:center; }
 </style>
 </head>
@@ -620,6 +831,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <thead><tr><th>Status</th><th>Nickname</th><th>IP address</th><th>Ping</th><th>MAC address</th><th>Device name</th><th>Last seen</th></tr></thead>
         <tbody id="devices"></tbody>
       </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>History (last 24 hours)</h2>
+    <div class="hnote" id="history-note">Collecting data...</div>
+    <div id="history"></div>
+    <div class="legend">
+      <span><i class="b-good"></i>online</span>
+      <span><i class="b-part"></i>partly online</span>
+      <span><i class="b-bad"></i>offline</span>
+      <span><i class="b-none"></i>no data</span>
+      <span>Each block is 30 minutes. The far right is now. Ping lines are scaled to each device's own highest value.</span>
     </div>
   </section>
 
@@ -720,6 +944,95 @@ function renderOutages(list) {
   });
 }
 
+function pct(v) {
+  if (v === null || v === undefined) return "-";
+  return v >= 99.95 ? "100%" : v.toFixed(1) + "%";
+}
+function msText(v) { return v === null || v === undefined ? "-" : Math.round(v) + " ms"; }
+
+// One block per half hour: green = online, amber = partly, red = offline, grey = no data.
+function strip(h, nowTs) {
+  const wrap = el("div", null, "strip");
+  for (let i = 0; i < 48; i++) {
+    const b = h ? h.buckets[i] : [null, null];
+    const block = el("span");
+    let cls = "b-none", tip = "No data";
+    if (b[0] !== null) {
+      cls = b[0] >= 0.95 ? "b-good" : (b[0] > 0 ? "b-part" : "b-bad");
+      tip = Math.round(b[0] * 100) + "% online";
+      if (b[1] !== null) tip += ", average ping " + Math.round(b[1]) + " ms";
+    }
+    block.className = cls;
+    const start = new Date((nowTs - (48 - i) * 1800) * 1000);
+    block.title = start.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + ": " + tip;
+    wrap.appendChild(block);
+  }
+  return wrap;
+}
+
+// A small line chart of the average ping in each half hour. Gaps mean the device did not answer.
+function sparkline(h) {
+  const values = h ? h.buckets.map((b) => b[1]) : [];
+  const numbers = values.filter((v) => v !== null && v !== undefined);
+  if (numbers.length < 2) return el("div", "Not enough ping data yet", "spark-empty");
+  const top = Math.max(...numbers, 1);
+  let d = "";
+  let drawing = false;
+  values.forEach((v, i) => {
+    if (v === null || v === undefined) { drawing = false; return; }
+    const x = (i / 47) * 240;
+    const y = 34 - (v / top) * 30;
+    d += (drawing ? " L" : " M") + x.toFixed(1) + " " + y.toFixed(1);
+    if (!drawing) d += " l0.01 0";
+    drawing = true;
+  });
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 240 36");
+  svg.setAttribute("preserveAspectRatio", "none");
+  svg.setAttribute("class", "spark");
+  const path = document.createElementNS(NS, "path");
+  path.setAttribute("d", d.trim());
+  svg.appendChild(path);
+  return svg;
+}
+
+function statsBlock(h) {
+  const box = el("div", null, "hstats");
+  if (!h) { box.appendChild(el("div", "No history yet")); return box; }
+  box.appendChild(el("div", "Uptime  24h " + pct(h.uptime_24h) + "   7d " + pct(h.uptime_7d)));
+  box.appendChild(el("div", "Ping  avg " + msText(h.avg_ms) + "   max " + msText(h.max_ms)));
+  return box;
+}
+
+function historyRow(r, nowTs) {
+  const row = el("div", null, "hrow");
+  const who = el("div");
+  who.appendChild(el("div", r.title, "who-name"));
+  who.appendChild(el("div", r.sub, "who-sub"));
+  row.appendChild(who);
+  row.appendChild(strip(r.h, nowTs));
+  row.appendChild(sparkline(r.h));
+  row.appendChild(statsBlock(r.h));
+  return row;
+}
+
+function renderHistory(s) {
+  const box = $("history");
+  clear(box);
+  box.appendChild(historyRow({ title: "Internet", sub: "8.8.8.8 and 1.1.1.1", h: s.internet_history }, s.now_ts));
+  s.devices.forEach((d) => {
+    box.appendChild(historyRow({
+      title: d.nickname || d.ip,
+      sub: d.nickname ? d.ip : (d.name || ""),
+      h: d.history,
+    }, s.now_ts));
+  });
+  $("history-note").textContent = s.history_since
+    ? "Tracking since " + shortDateTime(s.history_since) + ". Uptime only counts the time the monitor was running."
+    : "Collecting data...";
+}
+
 function render(s) {
   $("network").textContent = "Network " + s.network + "  |  router " + s.router + "  |  this PC " + s.my_ip;
   $("updated").textContent = "Updated " + s.updated + " (scan #" + s.scan + ")";
@@ -732,7 +1045,10 @@ function render(s) {
   if (s.internet.up) {
     net.textContent = "OK";
     net.className = "value t-good";
-    $("stat-internet-note").textContent = s.internet.ms !== null ? Math.round(s.internet.ms) + " ms to the internet" : "";
+    const parts = [];
+    if (s.internet.ms !== null) parts.push(Math.round(s.internet.ms) + " ms to the internet");
+    if (s.internet_history && s.internet_history.uptime_7d !== null) parts.push(pct(s.internet_history.uptime_7d) + " up over 7 days");
+    $("stat-internet-note").textContent = parts.join("  |  ");
   } else {
     net.textContent = "DOWN";
     net.className = "value t-bad";
@@ -750,6 +1066,7 @@ function render(s) {
   renderDevices(s.devices);
   renderEvents(s.events);
   renderOutages(s.outages);
+  renderHistory(s);
 }
 
 async function refresh() {
@@ -782,7 +1099,7 @@ def read_csv_tail(path, count):
 
 
 def publish_dashboard(known, nicknames, my_ip, network, router, round_number,
-                      interval, internet, alerts_text, warnings):
+                      interval, internet, alerts_text, warnings, stats, since_ts, now_ts):
     """Package the latest scan as JSON. The web page fetches this every few seconds."""
     devices = []
     for ip, d in known.items():
@@ -800,6 +1117,7 @@ def publish_dashboard(known, nicknames, my_ip, network, router, round_number,
             "mac": d.get("mac") or "",
             "name": d.get("name") or "",
             "last_seen": d["last_seen"],
+            "history": stats.get(device_key(ip, d)),
         })
     devices.sort(key=lambda x: (x["status"] == "offline", sort_key(x["ip"])))
 
@@ -816,6 +1134,9 @@ def publish_dashboard(known, nicknames, my_ip, network, router, round_number,
         "devices": devices,
         "events": read_csv_tail(LOG_FILE, 15),
         "outages": read_csv_tail(OUTAGE_FILE, 10),
+        "now_ts": now_ts,
+        "history_since": datetime.fromtimestamp(since_ts).strftime("%Y-%m-%d %H:%M:%S") if since_ts else None,
+        "internet_history": stats.get(INTERNET_KEY),
     }
     DASHBOARD["json"] = json.dumps(snapshot).encode("utf-8")
 
@@ -874,10 +1195,17 @@ def main():
     parser.add_argument("--share", action="store_true",
                         help="let phones and other devices on your WiFi open the dashboard too")
     parser.add_argument("--no-dashboard", action="store_true", help="turn the dashboard off")
+    parser.add_argument("--keep-days", type=int, default=30,
+                        help="days of history to keep (default 30)")
+    parser.add_argument("--report", action="store_true",
+                        help="print an uptime and speed report, then stop")
     parser.add_argument("--test-alert", action="store_true",
                         help="set up alerts.json and send a test message to your phone")
     args = parser.parse_args()
 
+    if args.report:
+        run_report()
+        return
     if args.test_alert:
         run_test_alert()
         return
@@ -897,10 +1225,20 @@ def main():
     network = ipaddress.ip_network(args.network) if args.network else detected_network
     router = args.router or find_router(network)
 
-    known = {}          # every device we have ever seen, keyed by IP address
+    known = load_known()    # every device we have ever seen (also from earlier runs), keyed by IP address
     alerter = Alerter()
     outage = None       # None while the internet is fine; details while it is down
     round_number = 0
+
+    history = None
+    history_problem = ""
+    try:
+        history = open_history()
+        prune_history(history, args.keep_days)
+    except sqlite3.Error:
+        history = None
+        history_problem = "Warning: history.db could not be opened, so uptime history is off."
+    last_prune = time.time()
 
     if args.no_dashboard or args.once:
         dashboard_text = "off"
@@ -952,9 +1290,22 @@ def main():
             # 2. Update the device list. If the internet is down AND the router is silent,
             #    this computer has probably lost its connection (or the power is out), so
             #    the scan is unreliable. We skip it rather than call every device "left".
-            if internet_up or router_ok:
+            trusted = internet_up or router_ok
+            if trusted:
                 update_devices(known, results, arp_table, nicknames, my_ip,
                                args.misses, alerter, baseline)
+
+            # Save this scan for the history. If the scan was not trusted (see above), we still
+            # save the internet result, but not the devices, so they are not counted as down.
+            now_ts = int(time.time())
+            if history is not None:
+                history_problem = record_history(history, now_ts, known, internet_up, internet_ms, trusted)
+                if time.time() - last_prune > 86400:
+                    try:
+                        prune_history(history, args.keep_days)
+                    except sqlite3.Error:
+                        pass
+                    last_prune = time.time()
 
             # 3. Send any waiting alerts (only works while the internet is up).
             alerter.flush(internet_up)
@@ -967,13 +1318,23 @@ def main():
             else:
                 internet_text = "OK"
 
-            warnings = [w for w in (nickname_problem, alerter.file_problem, alerter.send_problem) if w]
+            warnings = [w for w in (nickname_problem, alerter.file_problem, alerter.send_problem,
+                                    history_problem) if w]
+
+            stats, since_ts = {}, None
+            if history is not None:
+                try:
+                    stats = history_stats(history, now_ts)
+                    since_ts = history_since(history)
+                except sqlite3.Error:
+                    pass
 
             internet = {"up": internet_up, "ms": internet_ms,
                         "since": outage["start"].strftime("%H:%M:%S") if outage else None,
                         "cause": outage["cause"] if outage else None}
             publish_dashboard(known, nicknames, my_ip, network, router, round_number,
-                              args.interval, internet, alerter.channels_text(), warnings)
+                              args.interval, internet, alerter.channels_text(), warnings,
+                              stats, since_ts, now_ts)
 
             show_table(known, my_ip, network, round_number, nicknames, warnings,
                        internet_text, router, alerter.channels_text(), dashboard_text)
@@ -987,6 +1348,9 @@ def main():
 
     except KeyboardInterrupt:
         print("\nStopped. Your logs are in", LOG_FILE, "and", OUTAGE_FILE)
+    finally:
+        if history is not None:
+            history.close()
 
 
 if __name__ == "__main__":
