@@ -5,4 +5,5 @@ network_log.csv
 outage_log.csv
 nicknames.json
 history.db
+approved.json
 __pycache__/

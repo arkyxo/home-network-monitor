@@ -1,3 +1,4 @@
+
 import argparse
 import csv
 import ipaddress
@@ -23,6 +24,8 @@ STATE_FILE = "devices.json"         # the latest snapshot of every device seen s
 NICKNAME_FILE = "nicknames.json"    # your name tags, saved by MAC address
 ALERT_FILE = "alerts.json"          # your alert settings (this file holds secrets, keep it private)
 HISTORY_FILE = "history.db"         # every scan, saved for uptime and speed history
+APPROVED_FILE = "approved.json"     # the guest list for the stranger alarm (saved by MAC address)
+ALARM_COOLDOWN = 6 * 3600           # after a stranger alarm, wait this long before alarming about the same device again
 
 INTERNET_KEY = "__internet__"       # the name the internet goes by inside the history database
 BUCKET_SECONDS = 1800               # history charts use 30 minute blocks...
@@ -237,6 +240,159 @@ def name_device(ip, nickname):
 
 
 # ---------------------------------------------------------------------------
+# Stranger alarm
+# You approve the devices you recognize. After that, any device that joins and is
+# not on the list triggers an alert right away. Think of a guest list at the door:
+# the monitor cannot stop anyone from coming in, but it tells you when a name that
+# is not on the list shows up. Approvals are saved by MAC address in approved.json.
+#
+# Honest limits: someone who knows how can copy (fake) a MAC address, so this is a
+# tripwire, not a lock. And a device that ignores pings cannot be seen at all.
+# ---------------------------------------------------------------------------
+
+def load_approved():
+    """Returns (approved, problem). 'approved' is None while the alarm is off (no file yet)."""
+    try:
+        with open(APPROVED_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("not a dictionary")
+    except FileNotFoundError:
+        return None, ""
+    except (json.JSONDecodeError, ValueError):
+        return None, (f"Warning: {APPROVED_FILE} could not be read, so the stranger alarm is paused. "
+                      "Check for a missing comma or quote mark.")
+    return {str(k).lower(): str(v) for k, v in data.items()}, ""
+
+
+def save_approved(approved):
+    with open(APPROVED_FILE, "w", encoding="utf-8") as f:
+        json.dump(approved, f, indent=2, ensure_ascii=False)
+
+
+def is_stranger(ip, entry, approved, my_ip):
+    """True if the alarm is on and this device is not on the guest list. Your own PC never counts."""
+    if approved is None or ip == my_ip:
+        return False
+    return device_key(ip, entry) not in approved and ip not in approved
+
+
+def trust_of(ip, entry, approved, my_ip):
+    """'approved', 'unknown', or None when the alarm is off."""
+    if approved is None:
+        return None
+    return "unknown" if is_stranger(ip, entry, approved, my_ip) else "approved"
+
+
+def run_approve(targets):
+    """Handles:  --approve   (walk through devices)   or   --approve IP IP ...   (approve directly)"""
+    known = load_known()
+    if not known:
+        print("No devices have been seen yet. Run the monitor for a minute first, then try again.")
+        return
+    approved, problem = load_approved()
+    if problem:
+        print(problem)
+        print("Nothing was changed, so your existing approvals are safe.")
+        return
+    if approved is None:
+        approved = {}
+    nicknames, nickname_problem = load_nicknames()
+    try:
+        my_ip = get_my_network()[1]
+    except OSError:
+        my_ip = ""
+
+    def best_name(ip):
+        d = known[ip]
+        return find_nickname(ip, d.get("mac"), nicknames, my_ip) or d.get("name") or "Unknown device"
+
+    def label_for_file(ip):
+        """A readable note saved next to the MAC address in approved.json."""
+        name = best_name(ip)
+        return name if name != "Unknown device" else f"device at {ip} when approved"
+
+    if targets:
+        for ip in targets:
+            if ip not in known:
+                print(f"{ip}: I have not seen that address yet, so I skipped it.")
+                continue
+            approved[device_key(ip, known[ip])] = label_for_file(ip)
+            print(f"Approved: {best_name(ip)} ({ip})")
+        save_approved(approved)
+        return
+
+    pending = [ip for ip in sorted(known, key=sort_key)
+               if ip != my_ip and device_key(ip, known[ip]) not in approved and ip not in approved]
+    if not pending:
+        save_approved(approved)
+        print("Every device I know about is already approved. The stranger alarm is on.")
+        return
+
+    print(f"{len(pending)} device(s) to review. Only approve devices you recognize.")
+    print("Anything you leave as unknown will trigger an alarm when it joins the network.\n")
+    approve_rest = False
+    new_names = {}
+    try:
+        for number, ip in enumerate(pending, 1):
+            d = known[ip]
+            key = device_key(ip, d)
+            print(f"[{number}/{len(pending)}] {ip}")
+            print(f"    nickname: {best_name(ip) if best_name(ip) != 'Unknown device' else '-'}"
+                  f"   device name: {d.get('name') or '-'}")
+            print(f"    MAC address: {d.get('mac') or '(not available)'}   last seen: {d.get('last_seen') or '-'}")
+            if approve_rest:
+                answer = "y"
+            else:
+                answer = input("    Do you recognize it? y = approve, a = approve all the rest, "
+                               "q = save and quit, anything else = leave as unknown: ").strip().lower()
+            if answer == "q":
+                break
+            if answer == "a":
+                approve_rest = True
+                answer = "y"
+            if answer == "y":
+                approved[key] = label_for_file(ip)
+                if not approve_rest and best_name(ip) == "Unknown device" and not nickname_problem:
+                    name = input("    Nickname for it (press Enter to skip): ").strip()
+                    if name:
+                        new_names[key] = name
+                        approved[key] = name
+                print("    Approved.\n")
+            else:
+                print("    Left as unknown.\n")
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled. Nothing was saved.")
+        return
+
+    save_approved(approved)
+    if new_names:
+        nicknames.update(new_names)
+        save_nicknames(nicknames)
+    print(f"Saved. {len(approved)} approved device(s). The stranger alarm is on.")
+
+
+def run_unapprove(targets):
+    """Handles:  --unapprove IP ...   (or a MAC address)"""
+    approved, problem = load_approved()
+    if problem:
+        print(problem)
+        print("Nothing was changed.")
+        return
+    if approved is None:
+        print("The stranger alarm is not set up yet, so there is nothing to remove.")
+        return
+    known = load_known()
+    for target in targets:
+        keys = {target.lower()}
+        if target in known:
+            keys.add(device_key(target, known[target]))
+        removed = [k for k in keys if approved.pop(k, None) is not None]
+        print(f"Removed {target} from the approved list." if removed else f"{target} was not on the approved list.")
+    save_approved(approved)
+
+
+# ---------------------------------------------------------------------------
 # Phone alerts
 # ---------------------------------------------------------------------------
 
@@ -425,12 +581,14 @@ def sort_key(ip):
     return tuple(int(part) for part in ip.split("."))
 
 
-def update_devices(known, results, arp_table, nicknames, my_ip, miss_limit, alerter, baseline):
+def update_devices(known, results, arp_table, nicknames, my_ip, miss_limit, alerter, baseline,
+                   approved, alarm_times):
     """
     Update our list of devices from the latest scan.
     A device is only called 'left' after it misses several scans in a row, because
     phones often ignore a knock while their screen is off. 'baseline' is the very
-    first scan: we log what we find but do not send alerts for it.
+    first scan: we log what we find but do not send 'joined' alerts for it. The stranger
+    alarm is the exception: an unapproved device is worth an alert even at startup.
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     for r in results:
@@ -446,7 +604,14 @@ def update_devices(known, results, arp_table, nicknames, my_ip, miss_limit, aler
             if not was_online:
                 label = display_label(ip, entry, nicknames, my_ip)
                 log_event(ip, "joined", label)
-                if not baseline and ip != my_ip:
+                if is_stranger(ip, entry, approved, my_ip):
+                    key = device_key(ip, entry)
+                    if time.time() - alarm_times.get(key, 0) > ALARM_COOLDOWN:
+                        alarm_times[key] = time.time()
+                        log_event(ip, "stranger", label)
+                        alerter.queue(f"UNKNOWN DEVICE joined: {label} ({ip}, MAC {entry['mac'] or 'not available'}). "
+                                      f"If it is yours, approve it with: python home_network_monitor.py --approve {ip}")
+                elif not baseline and ip != my_ip:
                     alerter.queue(f"Joined: {label} ({ip})")
 
         elif ip in known and known[ip]["online"]:
@@ -462,7 +627,7 @@ def update_devices(known, results, arp_table, nicknames, my_ip, miss_limit, aler
 
 
 def show_table(known, my_ip, network, round_number, nicknames, warnings,
-               internet_text, router, alerts_text, dashboard_text):
+               internet_text, router, alerts_text, dashboard_text, approved):
     os.system("cls" if IS_WINDOWS else "clear")
     online_count = sum(1 for d in known.values() if d["online"])
     width = 98
@@ -471,6 +636,11 @@ def show_table(known, my_ip, network, round_number, nicknames, warnings,
           f"online: {online_count}   ever seen: {len(known)}")
     print(f"Internet: {internet_text}")
     print(f"Alerts: {alerts_text}")
+    if approved is None:
+        print("Stranger alarm: off (run  python home_network_monitor.py --approve  to turn it on)")
+    else:
+        strangers = sum(1 for ip, d in known.items() if d["online"] and is_stranger(ip, d, approved, my_ip))
+        print(f"Stranger alarm: ON, {len(approved)} approved device(s), {strangers} unapproved online now")
     print(f"Dashboard: {dashboard_text}")
     print("-" * width)
     print(f"{'IP ADDRESS':<16}{'STATUS':<9}{'PING':<9}{'NICKNAME':<20}"
@@ -489,8 +659,9 @@ def show_table(known, my_ip, network, round_number, nicknames, warnings,
         mac = d.get("mac") or "-"
         host = d.get("name") or "-"
         seen = d["last_seen"][11:]
+        flag = "  NOT APPROVED" if d["online"] and is_stranger(ip, d, approved, my_ip) else ""
         print(f"{ip:<16}{status:<9}{ping_text:<9}{nick[:19]:<20}"
-              f"{mac:<18}{host[:17]:<18}{seen}")
+              f"{mac:<18}{host[:17]:<18}{seen}{flag}")
     print("-" * width)
     for w in warnings:
         print(w)
@@ -738,6 +909,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   ul.list li:last-child { border-bottom:0; }
   ul.list .when { color:var(--muted); min-width:92px; font-variant-numeric:tabular-nums; }
   ul.list li.empty { color:var(--muted); }
+  .badge { margin-left:8px; padding:1px 8px; border-radius:999px; font-size:11px; font-weight:600;
+           background:#3d1f1f; color:var(--red); border:1px solid var(--red); vertical-align:1px; }
   .hnote { color:var(--muted); font-size:13px; margin:-4px 0 6px; }
   .hrow { display:grid; grid-template-columns:minmax(110px,0.8fr) minmax(220px,2fr) minmax(120px,1fr) 205px;
           gap:12px; align-items:center; padding:10px 0; border-bottom:1px solid var(--line); }
@@ -777,6 +950,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="note-text" id="stat-total"></div></div>
     <div class="card"><div class="label">Internet</div><div class="value" id="stat-internet">-</div>
       <div class="note-text" id="stat-internet-note"></div></div>
+    <div class="card"><div class="label">Stranger alarm</div><div class="value small" id="stat-stranger">-</div>
+      <div class="note-text" id="stat-stranger-note"></div></div>
     <div class="card"><div class="label">Phone alerts</div><div class="value small" id="stat-alerts">-</div></div>
     <div class="card"><div class="label">Scan speed</div><div class="value small" id="stat-scan">-</div>
       <div class="note-text" id="stat-scan-note"></div></div>
@@ -855,7 +1030,9 @@ function renderDevices(list) {
     st.appendChild(el("span", "", "dot " + d.status));
     st.appendChild(document.createTextNode(STATUS_TEXT[d.status] || d.status));
     tr.appendChild(st);
-    tr.appendChild(cell(d.nickname, "nick"));
+    const nickCell = el("td", d.nickname ? d.nickname : "-", "nick");
+    if (d.trust === "unknown") nickCell.appendChild(el("span", "not approved", "badge"));
+    tr.appendChild(nickCell);
     tr.appendChild(cell(d.ip, "mono"));
     tr.appendChild(cell(d.ms !== null && d.ms !== undefined ? Math.round(d.ms) + " ms" : "", ""));
     tr.appendChild(cell(d.mac, "mono"));
@@ -870,11 +1047,12 @@ function eventText(e) {
     return e.event === "down" ? "Internet went down (" + e.name + ")" : "Internet is back (" + e.name + ")";
   }
   const who = e.name && e.name !== e.ip ? e.name + " (" + e.ip + ")" : e.ip;
+  if (e.event === "stranger") return "ALARM: " + who + " joined and is not approved";
   return who + " " + e.event;
 }
 function eventColor(e) {
   if (e.event === "joined" || e.event === "back") return "t-good";
-  if (e.event === "down") return "t-bad";
+  if (e.event === "down" || e.event === "stranger") return "t-bad";
   return "t-warn";
 }
 
@@ -1013,12 +1191,33 @@ function render(s) {
     $("stat-internet-note").textContent = "since " + s.internet.since + ", likely cause: " + s.internet.cause;
   }
 
+  const guard = s.stranger;
+  const strangerValue = $("stat-stranger");
+  if (!guard.active) {
+    strangerValue.textContent = "Off";
+    strangerValue.className = "value small";
+    $("stat-stranger-note").textContent = "Run --approve in the terminal to turn it on";
+  } else if (guard.unknown_online.length === 0) {
+    strangerValue.textContent = "On, all clear";
+    strangerValue.className = "value small t-good";
+    $("stat-stranger-note").textContent = guard.approved_count + " approved devices";
+  } else {
+    strangerValue.textContent = guard.unknown_online.length + " not approved";
+    strangerValue.className = "value small t-bad";
+    $("stat-stranger-note").textContent = "See the devices table";
+  }
+
   $("stat-alerts").textContent = s.alerts;
   $("stat-scan").textContent = "Every " + s.interval + " seconds";
   $("stat-scan-note").textContent = "Scan #" + s.scan;
 
   const warnings = $("warnings");
   clear(warnings);
+  if (guard.active && guard.unknown_online.length > 0) {
+    const names = guard.unknown_online.map((u) => u.ip + (u.name ? " (" + u.name + ")" : "")).join(", ");
+    warnings.appendChild(el("div", "Not approved and online now: " + names +
+      ". If they are yours, run  python home_network_monitor.py --approve  in the terminal.", "banner err"));
+  }
   s.warnings.forEach((text) => warnings.appendChild(el("div", text, "banner note")));
 
   renderDevices(s.devices);
@@ -1057,7 +1256,7 @@ def read_csv_tail(path, count):
 
 
 def publish_dashboard(known, nicknames, my_ip, network, router, round_number,
-                      interval, internet, alerts_text, warnings, stats, since_ts, now_ts):
+                      interval, internet, alerts_text, warnings, stats, since_ts, now_ts, approved):
     """Package the latest scan as JSON. The web page fetches this every few seconds."""
     devices = []
     for ip, d in known.items():
@@ -1076,8 +1275,11 @@ def publish_dashboard(known, nicknames, my_ip, network, router, round_number,
             "name": d.get("name") or "",
             "last_seen": d["last_seen"],
             "history": stats.get(device_key(ip, d)),
+            "trust": trust_of(ip, d, approved, my_ip),
         })
     devices.sort(key=lambda x: (x["status"] == "offline", sort_key(x["ip"])))
+    unknown_online = [{"ip": x["ip"], "name": x["nickname"] or x["name"], "mac": x["mac"]}
+                      for x in devices if x["trust"] == "unknown" and x["status"] != "offline"]
 
     snapshot = {
         "scan": round_number,
@@ -1095,6 +1297,9 @@ def publish_dashboard(known, nicknames, my_ip, network, router, round_number,
         "now_ts": now_ts,
         "history_since": datetime.fromtimestamp(since_ts).strftime("%Y-%m-%d %H:%M:%S") if since_ts else None,
         "internet_history": stats.get(INTERNET_KEY),
+        "stranger": {"active": approved is not None,
+                     "approved_count": len(approved) if approved is not None else 0,
+                     "unknown_online": unknown_online},
     }
     DASHBOARD["json"] = json.dumps(snapshot).encode("utf-8")
 
@@ -1153,6 +1358,10 @@ def main():
     parser.add_argument("--share", action="store_true",
                         help="let phones and other devices on your WiFi open the dashboard too")
     parser.add_argument("--no-dashboard", action="store_true", help="turn the dashboard off")
+    parser.add_argument("--approve", nargs="*", metavar="IP",
+                        help="stranger alarm: go through devices one by one, or approve the given IPs")
+    parser.add_argument("--unapprove", nargs="+", metavar="IP",
+                        help="stranger alarm: take devices off the approved list")
     parser.add_argument("--keep-days", type=int, default=30,
                         help="days of history to keep (default 30)")
     parser.add_argument("--report", action="store_true",
@@ -1163,6 +1372,12 @@ def main():
 
     if args.report:
         run_report()
+        return
+    if args.approve is not None:
+        run_approve(args.approve)
+        return
+    if args.unapprove:
+        run_unapprove(args.unapprove)
         return
     if args.test_alert:
         run_test_alert()
@@ -1197,6 +1412,7 @@ def main():
         history = None
         history_problem = "Warning: history.db could not be opened, so uptime history is off."
     last_prune = time.time()
+    alarm_times = {}    # when each unapproved device last set off the alarm, so we do not repeat ourselves
 
     if args.no_dashboard or args.once:
         dashboard_text = "off"
@@ -1218,6 +1434,7 @@ def main():
             arp_table = read_arp_table()
             nicknames, nickname_problem = load_nicknames()   # re-read each scan, so edits apply live
             alerter.reload()
+            approved, approved_problem = load_approved()    # re-read each scan, so approvals apply live
 
             # 1. Is the internet working? If not, is it our home or the provider?
             internet_up, internet_ms = check_internet()
@@ -1251,7 +1468,7 @@ def main():
             trusted = internet_up or router_ok
             if trusted:
                 update_devices(known, results, arp_table, nicknames, my_ip,
-                               args.misses, alerter, baseline)
+                               args.misses, alerter, baseline, approved, alarm_times)
 
             # Save this scan for the history. If the scan was not trusted (see above), we still
             # save the internet result, but not the devices, so they are not counted as down.
@@ -1276,8 +1493,8 @@ def main():
             else:
                 internet_text = "OK"
 
-            warnings = [w for w in (nickname_problem, alerter.file_problem, alerter.send_problem,
-                                    history_problem) if w]
+            warnings = [w for w in (nickname_problem, approved_problem, alerter.file_problem,
+                                    alerter.send_problem, history_problem) if w]
 
             stats, since_ts = {}, None
             if history is not None:
@@ -1292,10 +1509,10 @@ def main():
                         "cause": outage["cause"] if outage else None}
             publish_dashboard(known, nicknames, my_ip, network, router, round_number,
                               args.interval, internet, alerter.channels_text(), warnings,
-                              stats, since_ts, now_ts)
+                              stats, since_ts, now_ts, approved)
 
             show_table(known, my_ip, network, round_number, nicknames, warnings,
-                       internet_text, router, alerter.channels_text(), dashboard_text)
+                       internet_text, router, alerter.channels_text(), dashboard_text, approved)
 
             with open(STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(known, f, indent=2)
