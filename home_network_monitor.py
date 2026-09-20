@@ -446,9 +446,21 @@ def load_nicknames():
     return {str(k).lower(): v for k, v in data.items()}, ""
 
 
+def write_json_atomic(path, data):
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    for _ in range(5):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            time.sleep(0.1)
+    os.replace(temp, path)
+
+
 def save_nicknames(nicknames):
-    with open(NICKNAME_FILE, "w", encoding="utf-8") as f:
-        json.dump(nicknames, f, indent=2, ensure_ascii=False)
+    write_json_atomic(NICKNAME_FILE, nicknames)
 
 
 def find_nickname(ip, mac, nicknames, my_ip):
@@ -511,8 +523,7 @@ def load_approved():
 
 
 def save_approved(approved):
-    with open(APPROVED_FILE, "w", encoding="utf-8") as f:
-        json.dump(approved, f, indent=2, ensure_ascii=False)
+    write_json_atomic(APPROVED_FILE, approved)
 
 
 def is_stranger(ip, entry, approved, my_ip):
@@ -705,6 +716,7 @@ class Alerter:
         self.file_problem = ""
         self.send_problem = ""
         self.pending = []
+        self.muted_until = 0
 
     def reload(self):
         self.settings, self.file_problem = load_alert_settings()
@@ -714,10 +726,14 @@ class Alerter:
         text = ", ".join(names) if names else "off (run --test-alert to set up)"
         if self.pending:
             text += f" ({len(self.pending)} waiting to send)"
+        if time.time() < self.muted_until:
+            text += f" (routine alerts muted until {datetime.fromtimestamp(self.muted_until):%H:%M})"
         return text
 
-    def queue(self, text):
+    def queue(self, text, urgent=False):
         if not configured_channels(self.settings):
+            return
+        if not urgent and time.time() < self.muted_until:
             return
         stamp = datetime.now().strftime("%H:%M")
         self.pending.append(f"[{stamp}] {text}")
@@ -816,7 +832,8 @@ def update_devices(known, results, arp_table, nicknames, my_ip, miss_limit, aler
                         alarm_times[key] = time.time()
                         log_event(ip, "stranger", label)
                         alerter.queue(f"UNKNOWN DEVICE joined: {label} ({ip}, MAC {entry['mac'] or 'not available'}). "
-                                      f"If it is yours, approve it with: python home_network_monitor.py --approve {ip}")
+                                      f"If it is yours, approve it with: python home_network_monitor.py --approve {ip}",
+                                      urgent=True)
                 elif not baseline and ip != my_ip:
                     alerter.queue(f"Joined: {label} ({ip})")
 
@@ -1232,7 +1249,7 @@ def check_weekly_summary(conn, known, nicknames, my_ip, alerter, weekday, hour, 
     if float(last_sent) >= slot:
         return
     set_meta(conn, "last_summary", str(now_ts))
-    alerter.queue(build_summary(conn, known, nicknames, my_ip, now_ts))
+    alerter.queue(build_summary(conn, known, nicknames, my_ip, now_ts), urgent=True)
 
 
 def run_summary_now():
@@ -1263,6 +1280,300 @@ def run_summary_now():
     else:
         problem = send_message(settings, text)
         print("Sent to your phone." if not problem else "It could not be sent: " + problem)
+
+
+BOT_HELP = """Your home network monitor. Commands:
+
+/status  how things look right now
+/devices  every device and whether it is online
+/quality  packet loss and jitter
+/report  uptime for the last 24 hours and 7 days
+/summary  the weekly summary, right now
+/approve  list devices that are waiting for approval
+/approve 192.168.1.30  approve a device
+/unapprove 192.168.1.30  take a device off the approved list
+/name 192.168.1.30 Living room TV  give a device a nickname
+/ping 192.168.1.30  test one device
+/mute 60  pause routine alerts for 60 minutes
+/unmute  turn alerts back on"""
+
+
+class TelegramBot:
+    def __init__(self, alerter, api=None):
+        self.alerter = alerter
+        self.api = api or self.telegram_api
+        self.state = "starting"
+        self.stop = threading.Event()
+
+    @staticmethod
+    def telegram_api(token, method, payload, timeout=35):
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/{method}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "HomeNetworkMonitor/1.0"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def snapshot(self):
+        try:
+            data = json.loads(DASHBOARD["json"])
+        except ValueError:
+            return {}
+        return data if data.get("devices") is not None else {}
+
+
+    def run(self):
+        offset = None
+        while not self.stop.is_set():
+            settings, _ = load_alert_settings()
+            token, chat = settings.get("telegram_token", ""), settings.get("telegram_chat_id", "")
+            if not token or not chat:
+                self.state = "off"
+                self.stop.wait(10)
+                continue
+            try:
+                if offset is None:
+                    data = self.api(token, "getUpdates", {"offset": -1, "limit": 1, "timeout": 0}, 15)
+                    results = data.get("result", [])
+                    offset = results[-1]["update_id"] + 1 if results else 0
+                data = self.api(token, "getUpdates",
+                                {"offset": offset, "timeout": 25, "allowed_updates": ["message"]}, 35)
+                self.state = "listening"
+                for update in data.get("result", []):
+                    offset = update["update_id"] + 1
+                    self.process(update, settings)
+            except urllib.error.HTTPError as error:
+                self.state = {401: "bad token", 409: "conflict"}.get(error.code, "error")
+                self.stop.wait(15 if error.code == 409 else 10)
+            except Exception:
+                self.state = "offline"
+                self.stop.wait(5)
+
+    def process(self, update, settings):
+        message = update.get("message") or {}
+        chat_id = str((message.get("chat") or {}).get("id", ""))
+        if not chat_id or chat_id != str(settings.get("telegram_chat_id", "")).strip():
+            return
+        text = message.get("text") or ""
+        reply = self.handle(text) if text.startswith("/") else "Send /help to see what I can do."
+        if reply:
+            self.api(settings["telegram_token"], "sendMessage", {"chat_id": chat_id, "text": reply[:4000]}, 15)
+
+
+    def handle(self, text):
+        parts = text.strip().split()
+        if not parts:
+            return ""
+        command = parts[0].split("@")[0].lower()
+        args = parts[1:]
+        if command in ("/start", "/help"):
+            return BOT_HELP
+        handlers = {"/status": self.cmd_status, "/devices": self.cmd_devices, "/quality": self.cmd_quality,
+                    "/report": self.cmd_report, "/summary": self.cmd_summary, "/approve": self.cmd_approve,
+                    "/unapprove": self.cmd_unapprove, "/name": self.cmd_name, "/ping": self.cmd_ping,
+                    "/mute": self.cmd_mute, "/unmute": self.cmd_unmute}
+        handler = handlers.get(command)
+        if handler is None:
+            return "I do not know that command. Send /help to see the list."
+        snap = self.snapshot()
+        if not snap and command not in ("/mute", "/unmute", "/summary"):
+            return "The monitor is still starting and has not finished its first scan. Try again in a minute."
+        try:
+            return handler(args, snap)
+        except Exception:
+            return "Something went wrong with that command. Try again, or check the monitor's window."
+
+    @staticmethod
+    def label(device):
+        ip = device["ip"]
+        name = device.get("nickname") or device.get("name") or ""
+        return f"{name} ({ip})" if name else ip
+
+    @staticmethod
+    def find_device(snap, ip):
+        return next((d for d in snap.get("devices", []) if d["ip"] == ip), None)
+
+
+    def cmd_status(self, args, snap):
+        lines = [f"Home network, scan {snap['scan']} at {snap['updated']}"]
+        internet = snap["internet"]
+        if internet["up"]:
+            line = "Internet: OK"
+            if internet.get("ms") is not None:
+                line += f", {internet['ms']:.0f} ms"
+            uptime = (snap.get("internet_history") or {}).get("uptime_7d")
+            if uptime is not None:
+                line += f", {uptime}% up over 7 days"
+        else:
+            line = f"Internet: DOWN since {internet['since']} (likely cause: {internet['cause']})"
+        lines.append(line)
+
+        quality = (snap.get("quality") or {}).get("internet")
+        if quality:
+            lines.append(f"Connection quality: {quality['verdict']} right now (last 24h: "
+                         f"{quality['loss_24h']}% lost, jitter {quality['jitter_24h']} ms)")
+        dns = snap.get("dns") or {}
+        lines.append(f"DNS: {dns['status'].upper()}. {dns['note']}" if dns.get("enabled") else "DNS: off")
+
+        devices = snap["devices"]
+        online = sum(1 for d in devices if d["status"] != "offline")
+        lines.append(f"Devices: {online} online, {len(devices)} seen in total")
+        guard = snap["stranger"]
+        if not guard["active"]:
+            lines.append("Stranger alarm: off")
+        elif guard["unknown_online"]:
+            names = ", ".join(u["ip"] + (f" ({u['name']})" if u["name"] else "") for u in guard["unknown_online"])
+            lines.append(f"Stranger alarm: NOT APPROVED and online: {names}")
+        else:
+            lines.append("Stranger alarm: on, all clear")
+        lines.append(f"Alerts: {snap['alerts']}")
+        return "\n".join(lines)
+
+    def cmd_devices(self, args, snap):
+        lines = []
+        for d in snap["devices"][:40]:
+            if d["status"] == "offline":
+                detail = f"offline, last seen {d['last_seen'][11:]}"
+            elif d["status"] == "checking":
+                detail = "checking (missed a scan)"
+            else:
+                detail = "online" + (f", {d['ms']:.0f} ms" if d.get("ms") is not None else "")
+            if d.get("trust") == "unknown":
+                detail += ", NOT APPROVED"
+            lines.append(f"{self.label(d)}: {detail}")
+        if len(snap["devices"]) > 40:
+            lines.append(f"...and {len(snap['devices']) - 40} more")
+        return "\n".join(lines) or "No devices seen yet."
+
+    def cmd_quality(self, args, snap):
+        quality = snap.get("quality") or {}
+        if not quality.get("enabled"):
+            return "Connection quality testing is off. Start the monitor without --quality-pings 0 to use it."
+        lines = ["Connection quality (last 24 hours)"]
+        for name, key in (("Internet", "internet"), ("Router", "router")):
+            q = quality.get(key)
+            if not q:
+                lines.append(f"{name}: no data yet")
+                continue
+            lines.append(f"{name}: {q['verdict']} right now. {q['loss_24h']}% lost, jitter {q['jitter_24h']} ms, "
+                         f"ping average {q['avg_ms']} ms, worst {q['max_ms']} ms")
+        return "\n".join(lines)
+
+    def cmd_report(self, args, snap):
+        def row(name, h):
+            if not h:
+                return f"{name}: no data yet"
+            return f"{name}: {h['uptime_24h']}% (24h), {h['uptime_7d']}% (7 days)"
+        lines = ["Uptime", row("Internet", snap.get("internet_history"))]
+        dns = snap.get("dns_history") or {}
+        if (snap.get("dns") or {}).get("enabled"):
+            lines.append(row("DNS lookups", dns.get("system")))
+        for d in snap["devices"][:30]:
+            lines.append(row(self.label(d), d.get("history")))
+        return "\n".join(lines)
+
+    def cmd_summary(self, args, snap):
+        try:
+            conn = open_history()
+            try:
+                nicknames, _ = load_nicknames()
+                return build_summary(conn, load_known(), nicknames, snap.get("my_ip", ""), int(time.time()))
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return "I could not read the history right now. Try again in a moment."
+
+
+    def cmd_approve(self, args, snap):
+        approved, problem = load_approved()
+        if problem:
+            return "approved.json could not be read, so nothing was changed. Check it on the computer."
+        if approved is None:
+            return ("The stranger alarm is off. On the computer, run  python home_network_monitor.py --approve  "
+                    "to go through your devices first. After that, /approve works from here.")
+        if not args:
+            waiting = [d for d in snap["devices"] if d.get("trust") == "unknown"]
+            if not waiting:
+                return "Nothing is waiting. Every device is approved."
+            lines = ["Not approved yet:"]
+            for d in waiting:
+                lines.append(f"{self.label(d)}  MAC {d.get('mac') or 'not available'}  ({d['status']})")
+            lines += ["", "Only approve devices you recognize. To approve one:", f"/approve {waiting[0]['ip']}"]
+            return "\n".join(lines)
+        lines = []
+        for ip in args[:10]:
+            device = self.find_device(snap, ip)
+            if device is None:
+                lines.append(f"{ip}: I have not seen that address.")
+                continue
+            approved[device.get("mac") or ip] = (device.get("nickname") or device.get("name")
+                                                 or f"device at {ip} when approved")
+            lines.append(f"Approved: {self.label(device)}")
+        save_approved(approved)
+        lines.append("The dashboard and alarm pick this up on the next scan.")
+        return "\n".join(lines)
+
+    def cmd_unapprove(self, args, snap):
+        approved, problem = load_approved()
+        if problem or approved is None:
+            return "The stranger alarm is not set up, so there is nothing to change."
+        if not args:
+            return "Use /unapprove followed by an IP address, for example /unapprove 192.168.1.30"
+        lines = []
+        for ip in args[:10]:
+            device = self.find_device(snap, ip)
+            keys = {ip}
+            if device and device.get("mac"):
+                keys.add(device["mac"])
+            removed = [k for k in keys if approved.pop(k, None) is not None]
+            lines.append(f"Removed {ip} from the approved list." if removed else f"{ip} was not on the approved list.")
+        save_approved(approved)
+        return "\n".join(lines)
+
+    def cmd_name(self, args, snap):
+        if len(args) < 2:
+            return "Use /name followed by an IP address and a nickname, for example /name 192.168.1.30 Living room TV"
+        device = self.find_device(snap, args[0])
+        if device is None:
+            return f"{args[0]}: I have not seen that address."
+        nickname = " ".join(args[1:])[:40]
+        nicknames, problem = load_nicknames()
+        if problem:
+            return "nicknames.json could not be read, so nothing was changed. Check it on the computer."
+        nicknames[device.get("mac") or device["ip"]] = nickname
+        save_nicknames(nicknames)
+        return f"Saved: {nickname} is {device['ip']}. It shows up on the next scan."
+
+    def cmd_ping(self, args, snap):
+        if not args:
+            return "Use /ping followed by an IP address, for example /ping 192.168.1.30"
+        try:
+            address = ipaddress.ip_address(args[0])
+            inside = address in ipaddress.ip_network(snap["network"])
+        except ValueError:
+            return "That does not look like an IP address on your home network."
+        if not inside:
+            return f"I only test devices on your home network ({snap['network']})."
+        online, ms = quick_ping(str(address))
+        return f"{address} answered in {ms:.0f} ms." if online and ms is not None else \
+               (f"{address} answered." if online else f"{address} did not answer. It may be off, asleep, or ignoring pings.")
+
+    def cmd_mute(self, args, snap):
+        minutes = 60
+        if args:
+            try:
+                minutes = int(args[0])
+            except ValueError:
+                return "Use /mute followed by a number of minutes, for example /mute 90"
+        minutes = max(1, min(minutes, 1440))
+        self.alerter.muted_until = time.time() + minutes * 60
+        until = datetime.fromtimestamp(self.alerter.muted_until).strftime("%H:%M" if minutes <= 720 else "%a %H:%M")
+        return (f"Routine alerts are muted until {until}. Stranger alarms and the weekly summary still come "
+                "through. Send /unmute to turn everything back on.")
+
+    def cmd_unmute(self, args, snap):
+        self.alerter.muted_until = 0
+        return "Alerts are back on."
 
 
 DASHBOARD = {"json": b"{}"}
@@ -1899,6 +2210,7 @@ def main():
                         help="stranger alarm: go through devices one by one, or approve the given IPs")
     parser.add_argument("--unapprove", nargs="+", metavar="IP",
                         help="stranger alarm: take devices off the approved list")
+    parser.add_argument("--no-bot", action="store_true", help="turn off Telegram commands (alerts still work)")
     parser.add_argument("--dns-server", metavar="IP",
                         help="the DNS server to test (detected automatically if left out)")
     parser.add_argument("--no-dns", action="store_true", help="turn the DNS check off")
@@ -1955,6 +2267,9 @@ def main():
 
     known = load_known()
     alerter = Alerter()
+    bot = TelegramBot(alerter)
+    if not args.no_bot and not args.once:
+        threading.Thread(target=bot.run, daemon=True).start()
     outage = None
     round_number = 0
 
@@ -2094,16 +2409,21 @@ def main():
             else:
                 quality_text = "off (use --quality-pings 10 to turn it on)"
 
+            alerts_text = alerter.channels_text()
+            if bot.state == "listening":
+                alerts_text += ", commands on (send /help to your bot)"
+            elif bot.state in ("bad token", "conflict"):
+                alerts_text += f", commands off ({bot.state})"
             dns_snapshot = dns_watcher.snapshot() if dns_enabled else {"enabled": False}
             internet = {"up": internet_up, "ms": internet_ms,
                         "since": outage["start"].strftime("%H:%M:%S") if outage else None,
                         "cause": outage["cause"] if outage else None}
             publish_dashboard(known, nicknames, my_ip, network, router, round_number,
-                              args.interval, internet, alerter.channels_text(), warnings,
+                              args.interval, internet, alerts_text, warnings,
                               stats, since_ts, now_ts, approved, quality_snapshot, dns_snapshot)
 
             show_table(known, my_ip, network, round_number, nicknames, warnings,
-                       internet_text, router, alerter.channels_text(), dashboard_text, approved, quality_text,
+                       internet_text, router, alerts_text, dashboard_text, approved, quality_text,
                        dns_text_for(dns_snapshot))
 
             with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -2116,6 +2436,7 @@ def main():
     except KeyboardInterrupt:
         print("\nStopped. Your logs are in", LOG_FILE, "and", OUTAGE_FILE)
     finally:
+        bot.stop.set()
         burst_pool.shutdown(wait=False)
         if history is not None:
             history.close()
