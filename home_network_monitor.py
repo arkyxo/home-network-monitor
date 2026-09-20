@@ -1,57 +1,3 @@
-"""
-Home Network Monitor
---------------------
-Finds the devices on your home WiFi by "pinging" every address on the network,
-shows a live table, and keeps a diary of what happens.
-
-Features
-    - Live table of devices, with nicknames like "Mom's phone"
-    - Phone alerts (Telegram and/or Discord) when a device joins or leaves
-    - Internet outage log, with a guess at whether the problem is your home
-      or your internet provider
-    - Live web dashboard: open http://localhost:8080 in your browser
-    - Connection quality: packet loss and jitter, measured with a small burst of pings
-      each scan, to the internet and to your router
-    - Stranger alarm: approve the devices you recognize, and get an instant alert when
-      any other device joins your network
-    - Uptime and speed history: "this device was online 97% of the week", and how
-      the ping time (delay) changed over the last 24 hours
-
-Uses only Python's built-in tools, so there is nothing to install.
-
-Run it:
-    python home_network_monitor.py               (scan forever, every 30 seconds)
-    python home_network_monitor.py --once        (scan one time, then stop)
-    python home_network_monitor.py --interval 10 (scan every 10 seconds)
-    python home_network_monitor.py --network 192.168.1.0/24  (if auto-detect guesses wrong)
-    python home_network_monitor.py --router 192.168.1.254    (if your router is not the default guess)
-
-Connection quality options:
-    python home_network_monitor.py --quality-pings 20   (pings per burst, default 10; 0 turns it off)
-
-Stranger alarm (approve your own devices first, or every device counts as a stranger):
-    python home_network_monitor.py --approve                (go through the devices one by one)
-    python home_network_monitor.py --approve 192.168.1.23   (approve a single device)
-    python home_network_monitor.py --unapprove 192.168.1.23 (take a device off the list)
-
-Uptime and speed report in the terminal (dashboard shows the same, with charts):
-    python home_network_monitor.py --report
-    python home_network_monitor.py --keep-days 60   (keep 60 days of history, default is 30)
-
-Dashboard options:
-    python home_network_monitor.py --share       (also let phones on your WiFi open the dashboard)
-    python home_network_monitor.py --port 8081   (use a different port if 8080 is busy)
-    python home_network_monitor.py --no-dashboard  (turn the dashboard off)
-
-Give a device a nickname (use the IP address you see in the table):
-    python home_network_monitor.py --name 192.168.1.23 "Mom's phone"
-
-Set up and test phone alerts (see alerts.json):
-    python home_network_monitor.py --test-alert
-
-Stop it any time with Ctrl+C.
-"""
-
 import argparse
 import csv
 import ipaddress
@@ -66,28 +12,29 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from datetime import datetime
+from datetime import datetime, timedelta
 
 IS_WINDOWS = platform.system().lower() == "windows"
-LOG_FILE = "network_log.csv"        # a diary of "joined" / "left" / "internet down" events
-OUTAGE_FILE = "outage_log.csv"      # one line per internet outage: start, end, how long, likely cause
-STATE_FILE = "devices.json"         # the latest snapshot of every device seen so far
-NICKNAME_FILE = "nicknames.json"    # your name tags, saved by MAC address
-ALERT_FILE = "alerts.json"          # your alert settings (this file holds secrets, keep it private)
-HISTORY_FILE = "history.db"         # every scan, saved for uptime and speed history
-APPROVED_FILE = "approved.json"     # the guest list for the stranger alarm (saved by MAC address)
-ALARM_COOLDOWN = 6 * 3600           # after a stranger alarm, wait this long before alarming about the same device again
+LOG_FILE = "network_log.csv"
+OUTAGE_FILE = "outage_log.csv"
+STATE_FILE = "devices.json"
+NICKNAME_FILE = "nicknames.json"
+ALERT_FILE = "alerts.json"
+HISTORY_FILE = "history.db"
+APPROVED_FILE = "approved.json"
+ALARM_COOLDOWN = 6 * 3600
 
-INTERNET_KEY = "__internet__"       # the name the internet goes by inside the history database
-ROUTER_KEY = "__router__"           # ...and the router
-BUCKET_SECONDS = 1800               # history charts use 30 minute blocks...
-BUCKET_COUNT = 48                   # ...and show 48 of them, which is the last 24 hours
+INTERNET_KEY = "__internet__"
+ROUTER_KEY = "__router__"
+SUMMARY_DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+BUCKET_SECONDS = 1800
+BUCKET_COUNT = 48
 
-INTERNET_TARGETS = ["8.8.8.8", "1.1.1.1"]   # well-known public servers we knock on to test the internet
+INTERNET_TARGETS = ["8.8.8.8", "1.1.1.1"]
 
-# How to ask each kind of computer "which address is my router?", and how to read the answer.
 GATEWAY_COMMANDS = [
     (["ip", "route", "show", "default"], r"default via (\d+\.\d+\.\d+\.\d+)"),
     (["route", "-n", "get", "default"], r"gateway:\s*(\d+\.\d+\.\d+\.\d+)"),
@@ -96,11 +43,8 @@ GATEWAY_COMMANDS = [
 
 
 def get_my_network():
-    """Work out which network this computer is on, for example 192.168.1.0/24."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # No data is actually sent. This just lets the OS tell us which
-        # network card (and therefore which address) it would use.
         s.connect(("8.8.8.8", 80))
         my_ip = s.getsockname()[0]
     finally:
@@ -109,7 +53,6 @@ def get_my_network():
 
 
 def find_router(network):
-    """Find the router's address (the 'front gate' of your home network)."""
     for cmd, pattern in GATEWAY_COMMANDS:
         try:
             output = subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
@@ -118,22 +61,17 @@ def find_router(network):
         match = re.search(pattern, output, re.MULTILINE)
         if match:
             return match.group(1)
-    return str(next(network.hosts()))   # fallback guess: the first address, usually the router
+    return str(next(network.hosts()))
 
-
-# ---------------------------------------------------------------------------
-# Pinging
-# ---------------------------------------------------------------------------
 
 def quick_ping(ip):
-    """Knock on one address once. Returns (did_it_answer, how_many_milliseconds)."""
     ip = str(ip)
     if IS_WINDOWS:
         cmd = ["ping", "-n", "1", "-w", "1000", ip]
     elif platform.system().lower() == "darwin":
-        cmd = ["ping", "-c", "1", "-W", "1000", ip]     # on a Mac, -W counts milliseconds
+        cmd = ["ping", "-c", "1", "-W", "1000", ip]
     else:
-        cmd = ["ping", "-c", "1", "-W", "1", ip]        # on Linux, -W counts seconds
+        cmd = ["ping", "-c", "1", "-W", "1", ip]
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=4)
@@ -141,8 +79,6 @@ def quick_ping(ip):
         return False, None
 
     output = result.stdout
-    # Windows can say "unreachable" and still exit with code 0,
-    # so we also look for "TTL", which only appears in a real reply.
     online = result.returncode == 0 and "TTL=" in output.upper()
 
     ms = None
@@ -154,7 +90,6 @@ def quick_ping(ip):
 
 
 def ping(ip):
-    """Knock on a device, and if it answers, also ask it for its name."""
     ip = str(ip)
     online, ms = quick_ping(ip)
     name = ""
@@ -167,18 +102,12 @@ def ping(ip):
 
 
 def sweep(network, workers=100):
-    """Ping every address on the network at the same time (fast)."""
     hosts = list(network.hosts())
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return list(pool.map(ping, hosts))
 
 
 def check_internet():
-    """
-    Is the internet working? We knock on two well-known servers, twice each.
-    If any one answers, the internet is up. Trying several times avoids false
-    alarms from one lost packet.
-    """
     for _ in range(2):
         for target in INTERNET_TARGETS:
             online, ms = quick_ping(target)
@@ -188,15 +117,9 @@ def check_internet():
 
 
 def parse_burst(output, count):
-    """
-    Read the text a ping burst printed and work out:
-      loss   = the percentage of pings that got no reply
-      jitter = how much the delay bounces around from one reply to the next
-               (the average gap between neighbouring replies, in milliseconds)
-    """
     times = []
     for line in output.splitlines():
-        if "ttl=" in line.lower():      # only real replies contain "TTL"
+        if "ttl=" in line.lower():
             match = re.search(r"time[=<]\s*([\d.]+)\s*ms", line, re.IGNORECASE)
             if match:
                 times.append(float(match.group(1)))
@@ -218,15 +141,10 @@ def parse_burst(output, count):
 
 
 def ping_burst(ip, count):
-    """
-    Send a small burst of pings to one address and measure the quality of the connection,
-    not just whether it is up. Returns a dictionary (see parse_burst), or None if the
-    ping command could not be run.
-    """
     ip = str(ip)
     system = platform.system().lower()
     if IS_WINDOWS:
-        cmd = ["ping", "-n", str(count), "-w", "1000", ip]         # Windows sends one ping per second
+        cmd = ["ping", "-n", str(count), "-w", "1000", ip]
     elif system == "darwin":
         cmd = ["ping", "-c", str(count), "-W", "1000", ip]
     else:
@@ -239,7 +157,6 @@ def ping_burst(ip, count):
 
 
 def quality_verdict(loss, jitter):
-    """A plain-words rating. Rough rules of thumb for real-time things like video calls and games."""
     if loss is None:
         return "no data yet"
     jitter = jitter if jitter is not None else 0
@@ -250,21 +167,77 @@ def quality_verdict(loss, jitter):
     return "Poor"
 
 
-# ---------------------------------------------------------------------------
-# Nicknames
-# A MAC address is a permanent ID number stamped on a device's network card,
-# like a serial number. IP addresses can change, but the MAC normally stays the
-# same, so nicknames are saved against the MAC.
-# ---------------------------------------------------------------------------
+class QualityWatcher:
+    WINDOW = 6
+    BAD_LOSS, BAD_JITTER = 5.0, 50.0
+    OK_LOSS, OK_JITTER = 2.0, 30.0
+    COOLDOWN = 1800
+
+    def __init__(self):
+        self.windows = {INTERNET_KEY: deque(maxlen=self.WINDOW), ROUTER_KEY: deque(maxlen=self.WINDOW)}
+        self.poor_since = {}
+        self.last_alert = {}
+
+    def numbers(self, key):
+        window = self.windows[key]
+        if len(window) < self.WINDOW:
+            return None
+        sent = sum(b["sent"] for b in window)
+        received = sum(b["received"] for b in window)
+        jitters = [b["jitter"] for b in window if b["jitter"] is not None]
+        loss = 100.0 * (sent - received) / sent if sent else 0.0
+        return loss, (sum(jitters) / len(jitters) if jitters else 0.0)
+
+    def is_bad(self, key):
+        n = self.numbers(key)
+        return n is not None and (n[0] > self.BAD_LOSS or n[1] > self.BAD_JITTER)
+
+    def update(self, quality, internet_up, trusted, alerter):
+        if not trusted:
+            for window in self.windows.values():
+                window.clear()
+            return
+        if not internet_up:
+            self.windows[INTERNET_KEY].clear()
+
+        for key, burst in quality.items():
+            if burst and not (key == INTERNET_KEY and not internet_up):
+                self.windows[key].append(burst)
+
+        for key in (ROUTER_KEY, INTERNET_KEY):
+            numbers = self.numbers(key)
+            if numbers is None:
+                continue
+            loss, jitter = numbers
+            name = "the internet" if key == INTERNET_KEY else "your router"
+            short = "internet" if key == INTERNET_KEY else "router"
+            detail = f"{loss:.0f}% of test pings lost, jitter {jitter:.0f} ms"
+
+            if key in self.poor_since:
+                if loss <= self.OK_LOSS and jitter <= self.OK_JITTER:
+                    seconds = (datetime.now() - self.poor_since.pop(key)).total_seconds()
+                    log_event(short, "recovered", detail)
+                    alerter.queue(f"Connection to {name} is back to normal after {format_duration(seconds)}.")
+            elif (loss > self.BAD_LOSS or jitter > self.BAD_JITTER) \
+                    and time.time() - self.last_alert.get(key, 0) > self.COOLDOWN:
+                self.poor_since[key] = datetime.now()
+                self.last_alert[key] = time.time()
+                log_event(short, "poor", detail)
+                if key == ROUTER_KEY:
+                    hint = "Your WiFi or router may be struggling (weak signal, crowding or interference)."
+                elif ROUTER_KEY in self.poor_since or self.is_bad(ROUTER_KEY):
+                    hint = "Your router looks affected too, so check your WiFi and router."
+                else:
+                    hint = "Your router looks fine, so the problem is probably your internet provider."
+                alerter.queue(f"Poor connection to {name}: {detail} over the last few minutes. {hint}")
+
 
 def normalize_mac(raw):
-    """Make every MAC look the same: lowercase, colons, two characters per part."""
     parts = re.split(r"[:-]", raw.strip())
     return ":".join(p.zfill(2) for p in parts).lower()
 
 
 def parse_arp_output(output):
-    """Pull 'IP address -> MAC address' pairs out of the text the computer gives us."""
     table = {}
     for line in output.splitlines():
         ip_match = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", line)
@@ -277,10 +250,6 @@ def parse_arp_output(output):
 
 
 def read_arp_table():
-    """
-    Read the computer's own address book of which MAC belongs to which IP.
-    Every time we ping a device, the computer quietly writes it down here.
-    """
     for cmd in (["arp", "-a"], ["ip", "neigh"]):
         try:
             output = subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
@@ -293,7 +262,6 @@ def read_arp_table():
 
 
 def load_nicknames():
-    """Returns (nicknames, problem). 'problem' is a message if the file is broken."""
     try:
         with open(NICKNAME_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -311,7 +279,6 @@ def save_nicknames(nicknames):
 
 
 def find_nickname(ip, mac, nicknames, my_ip):
-    """Look for a name tag by MAC first, then by IP. Your own PC gets a default tag."""
     if mac and mac in nicknames:
         return nicknames[mac]
     if ip in nicknames:
@@ -322,21 +289,19 @@ def find_nickname(ip, mac, nicknames, my_ip):
 
 
 def display_label(ip, entry, nicknames, my_ip):
-    """The best name we have for a device: nickname, then its own name, then 'Unknown device'."""
     return (find_nickname(ip, entry.get("mac"), nicknames, my_ip)
             or entry.get("name")
             or "Unknown device")
 
 
 def name_device(ip, nickname):
-    """Handles:  --name 192.168.1.23 "Mom's phone" """
     try:
         ipaddress.ip_address(ip)
     except ValueError:
         print(f"'{ip}' does not look like an IP address. Example: 192.168.1.23")
         return
 
-    ping(ip)  # knocking makes sure the device is in the computer's address book
+    ping(ip)
     mac = read_arp_table().get(ip)
 
     nicknames, problem = load_nicknames()
@@ -358,19 +323,7 @@ def name_device(ip, nickname):
               "address instead. If that IP changes, the name will not follow.")
 
 
-# ---------------------------------------------------------------------------
-# Stranger alarm
-# You approve the devices you recognize. After that, any device that joins and is
-# not on the list triggers an alert right away. Think of a guest list at the door:
-# the monitor cannot stop anyone from coming in, but it tells you when a name that
-# is not on the list shows up. Approvals are saved by MAC address in approved.json.
-#
-# Honest limits: someone who knows how can copy (fake) a MAC address, so this is a
-# tripwire, not a lock. And a device that ignores pings cannot be seen at all.
-# ---------------------------------------------------------------------------
-
 def load_approved():
-    """Returns (approved, problem). 'approved' is None while the alarm is off (no file yet)."""
     try:
         with open(APPROVED_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -390,21 +343,18 @@ def save_approved(approved):
 
 
 def is_stranger(ip, entry, approved, my_ip):
-    """True if the alarm is on and this device is not on the guest list. Your own PC never counts."""
     if approved is None or ip == my_ip:
         return False
     return device_key(ip, entry) not in approved and ip not in approved
 
 
 def trust_of(ip, entry, approved, my_ip):
-    """'approved', 'unknown', or None when the alarm is off."""
     if approved is None:
         return None
     return "unknown" if is_stranger(ip, entry, approved, my_ip) else "approved"
 
 
 def run_approve(targets):
-    """Handles:  --approve   (walk through devices)   or   --approve IP IP ...   (approve directly)"""
     known = load_known()
     if not known:
         print("No devices have been seen yet. Run the monitor for a minute first, then try again.")
@@ -427,7 +377,6 @@ def run_approve(targets):
         return find_nickname(ip, d.get("mac"), nicknames, my_ip) or d.get("name") or "Unknown device"
 
     def label_for_file(ip):
-        """A readable note saved next to the MAC address in approved.json."""
         name = best_name(ip)
         return name if name != "Unknown device" else f"device at {ip} when approved"
 
@@ -492,7 +441,6 @@ def run_approve(targets):
 
 
 def run_unapprove(targets):
-    """Handles:  --unapprove IP ...   (or a MAC address)"""
     approved, problem = load_approved()
     if problem:
         print(problem)
@@ -511,10 +459,6 @@ def run_unapprove(targets):
     save_approved(approved)
 
 
-# ---------------------------------------------------------------------------
-# Phone alerts
-# ---------------------------------------------------------------------------
-
 ALERT_TEMPLATE = {
     "telegram_token": "",
     "telegram_chat_id": "",
@@ -523,7 +467,6 @@ ALERT_TEMPLATE = {
 
 
 def load_alert_settings():
-    """Returns (settings, problem). 'problem' is a message if the file is broken."""
     try:
         with open(ALERT_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -536,7 +479,6 @@ def load_alert_settings():
 
 
 def configured_channels(settings):
-    """Which alert channels have been filled in."""
     channels = []
     if settings.get("telegram_token") and settings.get("telegram_chat_id"):
         channels.append("Telegram")
@@ -546,22 +488,15 @@ def configured_channels(settings):
 
 
 def post_json(url, payload):
-    """Send a small JSON message to a web address."""
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url, data=data,
-        # Discord refuses requests that do not introduce themselves, so we add a name tag.
         headers={"Content-Type": "application/json", "User-Agent": "HomeNetworkMonitor/1.0"})
     with urllib.request.urlopen(request, timeout=10) as response:
         return response.status
 
 
 def send_message(settings, text):
-    """
-    Send one message to every channel that is set up.
-    Returns "" if at least one channel delivered it, otherwise a short problem description.
-    We never print the raw error, because it could contain your secret token.
-    """
     channels = configured_channels(settings)
     if not channels:
         return "No alert channel is filled in yet in alerts.json."
@@ -592,12 +527,6 @@ def send_message(settings, text):
 
 
 class Alerter:
-    """
-    Collects alert messages and sends them at the end of each scan, all in one
-    message so your phone does not buzz ten times. If sending fails (for example
-    the internet is down), messages wait in line and go out later.
-    """
-
     def __init__(self):
         self.settings = {}
         self.file_problem = ""
@@ -605,7 +534,6 @@ class Alerter:
         self.pending = []
 
     def reload(self):
-        """Re-read alerts.json every scan, so edits apply without restarting."""
         self.settings, self.file_problem = load_alert_settings()
 
     def channels_text(self):
@@ -620,7 +548,7 @@ class Alerter:
             return
         stamp = datetime.now().strftime("%H:%M")
         self.pending.append(f"[{stamp}] {text}")
-        self.pending = self.pending[-50:]     # never let the waiting line grow forever
+        self.pending = self.pending[-50:]
 
     def flush(self, internet_up):
         if not self.pending or not internet_up:
@@ -635,7 +563,6 @@ class Alerter:
 
 
 def run_test_alert():
-    """Handles:  --test-alert"""
     settings, problem = load_alert_settings()
     if problem:
         print(problem)
@@ -660,12 +587,7 @@ def run_test_alert():
         print("Sent! Check your phone.")
 
 
-# ---------------------------------------------------------------------------
-# Logging and display
-# ---------------------------------------------------------------------------
-
 def log_event(ip, event, label):
-    """Add one line to the diary file."""
     new_file = not os.path.exists(LOG_FILE)
     with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -675,7 +597,6 @@ def log_event(ip, event, label):
 
 
 def log_outage(start, end, seconds, cause):
-    """Add one line to the outage file. Written once the internet comes back."""
     new_file = not os.path.exists(OUTAGE_FILE)
     with open(OUTAGE_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -702,13 +623,6 @@ def sort_key(ip):
 
 def update_devices(known, results, arp_table, nicknames, my_ip, miss_limit, alerter, baseline,
                    approved, alarm_times):
-    """
-    Update our list of devices from the latest scan.
-    A device is only called 'left' after it misses several scans in a row, because
-    phones often ignore a knock while their screen is off. 'baseline' is the very
-    first scan: we log what we find but do not send 'joined' alerts for it. The stranger
-    alarm is the exception: an unapproved device is worth an alert even at startup.
-    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     for r in results:
         ip = r["ip"]
@@ -771,7 +685,7 @@ def show_table(known, my_ip, network, round_number, nicknames, warnings,
         if not d["online"]:
             status = "offline"
         elif d.get("misses", 0) > 0:
-            status = "ONLINE?"     # missed a scan, waiting to see if it is really gone
+            status = "ONLINE?"
         else:
             status = "ONLINE"
         ping_text = f"{d['ms']:.0f} ms" if d["ms"] is not None else "-"
@@ -788,16 +702,6 @@ def show_table(known, my_ip, network, round_number, nicknames, warnings,
     print('Name a device:  python home_network_monitor.py --name <IP> "Nickname"      Stop: Ctrl+C')
 
 
-# ---------------------------------------------------------------------------
-# History (uptime and speed)
-# Every scan is saved in a small database file (SQLite, which comes with Python).
-# From it we can work out "this device was online 97% of the week" and chart how
-# the ping time (latency, which just means delay) changes over time.
-#
-# A note on honesty: uptime only counts the time this monitor was running. If your
-# computer was off for a day, that day is not counted as "down" for anything.
-# ---------------------------------------------------------------------------
-
 def open_history():
     conn = sqlite3.connect(HISTORY_FILE, timeout=10)
     conn.execute("CREATE TABLE IF NOT EXISTS samples (ts INTEGER, key TEXT, online INTEGER, ms REAL)")
@@ -806,25 +710,19 @@ def open_history():
     conn.execute("CREATE TABLE IF NOT EXISTS quality "
                  "(ts INTEGER, key TEXT, sent INTEGER, received INTEGER, avg_ms REAL, max_ms REAL, jitter REAL)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_quality_key_ts ON quality (key, ts)")
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     conn.commit()
     return conn
 
 
 def device_key(ip, entry):
-    """What a device is filed under in the history: its MAC address if we know it, else its IP."""
     return entry.get("mac") or ip
 
 
 def record_history(conn, ts, known, internet_up, internet_ms, save_devices):
-    """
-    Save one row per device (and one for the internet) for this scan.
-    Returns "" if all went well, or a short warning if the database could not be written.
-    """
     try:
         rows = [(ts, INTERNET_KEY, 1 if internet_up else 0, internet_ms)]
         if save_devices:
-            # If a device changed IP address, we know it under two entries but it is one device.
-            # Keep the online one, so it is not counted as both up and down at once.
             by_key = {}
             for ip, d in known.items():
                 online = 1 if d["online"] else 0
@@ -841,7 +739,6 @@ def record_history(conn, ts, known, internet_up, internet_ms, save_devices):
 
 
 def prune_history(conn, keep_days):
-    """Delete samples older than keep_days, so the file does not grow forever."""
     cutoff = int(time.time()) - keep_days * 86400
     conn.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
     conn.execute("DELETE FROM quality WHERE ts < ?", (cutoff,))
@@ -849,7 +746,6 @@ def prune_history(conn, keep_days):
 
 
 def record_quality(conn, ts, quality):
-    """Save this scan's ping bursts. 'quality' maps INTERNET_KEY and ROUTER_KEY to results (or None)."""
     try:
         rows = [(ts, key, b["sent"], b["received"], b["avg"], b["max"], b["jitter"])
                 for key, b in quality.items() if b]
@@ -862,11 +758,6 @@ def record_quality(conn, ts, quality):
 
 
 def quality_stats(conn, now_ts):
-    """
-    For the internet and the router: packet loss, jitter and ping over the last 24 hours,
-    a rating based on the last hour, and 48 half-hour blocks for the charts.
-    Each block is [loss_percent, jitter_ms, average_ping_ms], with None where there is no data.
-    """
     day_start = now_ts - 86400
     hour_start = now_ts - 3600
     stats = {}
@@ -892,7 +783,6 @@ def quality_stats(conn, now_ts):
         entry["max_ms"] = round(max_ms, 1) if max_ms is not None else None
         entry["avg_ms"] = round(weighted / weight, 1) if weight else None
 
-    # The rating looks at the last hour only, so it says how the connection is doing right now.
     for key, sent, received, jitter in conn.execute(
             "SELECT key, SUM(sent), SUM(received), AVG(jitter) FROM quality WHERE ts >= ? GROUP BY key",
             (hour_start,)):
@@ -910,17 +800,11 @@ def quality_stats(conn, now_ts):
 
 
 def history_since(conn):
-    """When the oldest saved sample was taken (as a timestamp), or None if there is none."""
     row = conn.execute("SELECT MIN(ts) FROM samples").fetchone()
     return row[0] if row else None
 
 
 def history_stats(conn, now_ts):
-    """
-    Work out, for every device (and the internet): uptime over 24 hours and 7 days,
-    average and worst ping over 24 hours, and 48 half-hour blocks for the charts.
-    Each block is [fraction_online, average_ping_ms], with None where there is no data.
-    """
     day_start = now_ts - 86400
     week_start = now_ts - 7 * 86400
     stats = {}
@@ -945,7 +829,6 @@ def history_stats(conn, now_ts):
         entry["avg_ms"] = round(avg_ms, 1) if avg_ms is not None else None
         entry["max_ms"] = round(max_ms, 1) if max_ms is not None else None
 
-    # Bucket 0 is the newest half hour. We store them oldest first, so the chart reads left to right.
     for key, b, n, ups, avg_ms in conn.execute(
             "SELECT key, CAST((? - ts) / ? AS INTEGER) AS b, COUNT(*), SUM(online), AVG(ms) "
             "FROM samples WHERE ts >= ? GROUP BY key, b", (now_ts, BUCKET_SECONDS, day_start)):
@@ -957,11 +840,6 @@ def history_stats(conn, now_ts):
 
 
 def load_known():
-    """
-    Remember the devices from earlier runs (devices.json), as 'offline until seen again'.
-    Without this, a device that was away when you restarted the monitor would not be
-    tracked, and its time away would be missing from the uptime figures.
-    """
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -977,7 +855,6 @@ def load_known():
 
 
 def run_report():
-    """Handles:  --report   (prints the uptime and speed numbers in the terminal)"""
     if not os.path.exists(HISTORY_FILE):
         print("No history yet. Run the monitor for a while first, then try again.")
         return
@@ -1052,14 +929,160 @@ def run_report():
     print("-" * 88)
 
 
-# ---------------------------------------------------------------------------
-# Live dashboard
-# The monitor also runs a tiny web server. Open http://localhost:8080 in your
-# browser and you get a live page with the same information as the table.
-# The page asks the server for fresh numbers every few seconds.
-# ---------------------------------------------------------------------------
+def get_meta(conn, key):
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
 
-DASHBOARD = {"json": b"{}"}     # the latest snapshot, replaced after every scan
+
+def set_meta(conn, key, value):
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+
+
+def latest_summary_slot(now, weekday, hour):
+    slot = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    slot -= timedelta(days=(slot.weekday() - weekday) % 7)
+    if slot > now:
+        slot -= timedelta(days=7)
+    return slot
+
+
+def iso_to_ts(text):
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError):
+        return 0
+
+
+def quality_period(conn, since_ts):
+    out = {}
+    for key, sent, received, jitter, weighted, weight in conn.execute(
+            "SELECT key, SUM(sent), SUM(received), AVG(jitter), SUM(avg_ms * received), "
+            "SUM(CASE WHEN avg_ms IS NOT NULL THEN received END) FROM quality WHERE ts >= ? GROUP BY key",
+            (since_ts,)):
+        out[key] = {"loss": 100.0 * (sent - received) / sent if sent else None,
+                    "jitter": jitter,
+                    "avg_ms": weighted / weight if weight else None}
+    return out
+
+
+def build_summary(conn, known, nicknames, my_ip, now_ts):
+    def pct(v):
+        return "no data" if v is None else ("100%" if v >= 99.95 else f"{v:.1f}%")
+
+    def name_or_ip(ip, entry):
+        label = display_label(ip, entry, nicknames, my_ip)
+        return ip if label == "Unknown device" else label
+
+    week_start = now_ts - 7 * 86400
+    stats = history_stats(conn, now_ts)
+    quality = quality_period(conn, week_start)
+    since_ts = history_since(conn)
+    approved, _ = load_approved()
+
+    first = datetime.fromtimestamp(week_start).strftime("%b %d")
+    last = datetime.fromtimestamp(now_ts).strftime("%b %d")
+    lines = [f"Weekly summary ({first} to {last})"]
+    if since_ts and now_ts - since_ts < 6.5 * 86400:
+        lines.append(f"Note: the monitor only has {format_duration(now_ts - since_ts)} of data so far.")
+    lines.append("")
+
+    net = stats.get(INTERNET_KEY)
+    up_text = pct(net["uptime_7d"]) + " up" if net else "no data"
+    outages = [o for o in read_csv_tail(OUTAGE_FILE, 1000) if iso_to_ts(o.get("start")) >= week_start]
+    if outages:
+        seconds = [int(o["seconds"]) for o in outages]
+        lines.append(f"Internet: {up_text}, {len(outages)} outage(s), {format_duration(sum(seconds))} "
+                     f"in total, longest {format_duration(max(seconds))}")
+    else:
+        lines.append(f"Internet: {up_text}, no outages")
+
+    for key, name in ((INTERNET_KEY, "Internet"), (ROUTER_KEY, "Router")):
+        q = quality.get(key)
+        if q and q["loss"] is not None:
+            jitter = "-" if q["jitter"] is None else f"{q['jitter']:.0f} ms"
+            ping = "-" if q["avg_ms"] is None else f"{q['avg_ms']:.0f} ms"
+            lines.append(f"{name} quality: {q['loss']:.1f}% of test pings lost, jitter {jitter}, average ping {ping}")
+
+    lines += ["", "Devices (uptime this week):"]
+    rows, seen = [], set()
+    for ip in sorted(known, key=sort_key):
+        d = known[ip]
+        key = device_key(ip, d)
+        st = stats.get(key)
+        if key in seen or not st or not st["samples_7d"]:
+            continue
+        seen.add(key)
+        rows.append((name_or_ip(ip, d), st["uptime_7d"]))
+    for name, uptime in rows[:15]:
+        lines.append(f"{name}: {pct(uptime)}")
+    if len(rows) > 15:
+        lines.append(f"...and {len(rows) - 15} more")
+    if not rows:
+        lines.append("No device data yet.")
+
+    if since_ts and since_ts <= week_start + 86400:
+        new = []
+        for ip, d in known.items():
+            try:
+                first_seen = datetime.strptime(d.get("first_seen", ""), "%Y-%m-%d %H:%M:%S").timestamp()
+            except ValueError:
+                continue
+            if first_seen >= week_start and ip != my_ip:
+                note = " (not approved)" if is_stranger(ip, d, approved, my_ip) else ""
+                label = name_or_ip(ip, d)
+                new.append(f"{label}{note}" if label == ip else f"{label} ({ip}){note}")
+        lines += ["", "New devices this week: " + (", ".join(new) if new else "none")]
+        if approved is not None:
+            alarms = sum(1 for r in read_csv_tail(LOG_FILE, 100000)
+                         if r.get("event") == "stranger" and iso_to_ts(r.get("time")) >= week_start)
+            lines.append(f"Stranger alarms: {alarms}")
+    return "\n".join(lines)
+
+
+def check_weekly_summary(conn, known, nicknames, my_ip, alerter, weekday, hour, now_ts):
+    slot = latest_summary_slot(datetime.fromtimestamp(now_ts), weekday, hour).timestamp()
+    last_sent = get_meta(conn, "last_summary")
+    if last_sent is None:
+        set_meta(conn, "last_summary", str(now_ts))
+        return
+    if float(last_sent) >= slot:
+        return
+    set_meta(conn, "last_summary", str(now_ts))
+    alerter.queue(build_summary(conn, known, nicknames, my_ip, now_ts))
+
+
+def run_summary_now():
+    if not os.path.exists(HISTORY_FILE):
+        print("No history yet. Run the monitor for a while first, then try again.")
+        return
+    try:
+        conn = open_history()
+        known = load_known()
+        nicknames, _ = load_nicknames()
+        try:
+            my_ip = get_my_network()[1]
+        except OSError:
+            my_ip = ""
+        text = build_summary(conn, known, nicknames, my_ip, int(time.time()))
+        conn.close()
+    except sqlite3.Error:
+        print("Could not read history.db. Try again in a moment.")
+        return
+
+    print(text)
+    print()
+    settings, problem = load_alert_settings()
+    if problem:
+        print(problem)
+    elif not configured_channels(settings):
+        print("Phone alerts are not set up yet, so this was only shown here. See --test-alert.")
+    else:
+        problem = send_message(settings, text)
+        print("Sent to your phone." if not problem else "It could not be sent: " + problem)
+
+
+DASHBOARD = {"json": b"{}"}
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -1213,8 +1236,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script>
 const $ = (id) => document.getElementById(id);
 
-// Text is always added with textContent, never as HTML. Device names come from the
-// network, and this way a device with a strange name cannot inject code into the page.
 function el(tag, text, cls) {
   const node = document.createElement(tag);
   if (text !== undefined && text !== null) node.textContent = text;
@@ -1265,15 +1286,19 @@ function renderDevices(list) {
 }
 
 function eventText(e) {
-  if (e.ip === "internet") {
-    return e.event === "down" ? "Internet went down (" + e.name + ")" : "Internet is back (" + e.name + ")";
+  if (e.ip === "internet" || e.ip === "router") {
+    const what = e.ip === "internet" ? "the internet" : "the router";
+    if (e.event === "down") return "Internet went down (" + e.name + ")";
+    if (e.event === "back") return "Internet is back (" + e.name + ")";
+    if (e.event === "poor") return "Connection to " + what + " is poor (" + e.name + ")";
+    if (e.event === "recovered") return "Connection to " + what + " is back to normal (" + e.name + ")";
   }
   const who = e.name && e.name !== e.ip ? e.name + " (" + e.ip + ")" : e.ip;
   if (e.event === "stranger") return "ALARM: " + who + " joined and is not approved";
   return who + " " + e.event;
 }
 function eventColor(e) {
-  if (e.event === "joined" || e.event === "back") return "t-good";
+  if (e.event === "joined" || e.event === "back" || e.event === "recovered") return "t-good";
   if (e.event === "down" || e.event === "stranger") return "t-bad";
   return "t-warn";
 }
@@ -1308,7 +1333,6 @@ function pct(v) {
 }
 function msText(v) { return v === null || v === undefined ? "-" : Math.round(v) + " ms"; }
 
-// One block per half hour: green = online, amber = partly, red = offline, grey = no data.
 function strip(h, nowTs) {
   const wrap = el("div", null, "strip");
   for (let i = 0; i < 48; i++) {
@@ -1328,7 +1352,6 @@ function strip(h, nowTs) {
   return wrap;
 }
 
-// A small line chart of the average ping in each half hour. Gaps mean the device did not answer.
 function sparkline(h, emptyText) {
   const values = h ? h.buckets.map((b) => b[1]) : [];
   const numbers = values.filter((v) => v !== null && v !== undefined);
@@ -1391,7 +1414,6 @@ function renderHistory(s) {
     : "Collecting data...";
 }
 
-// The connection quality rows: lost pings per half hour, and jitter over time.
 function lossStrip(q, nowTs) {
   const wrap = el("div", null, "strip");
   for (let i = 0; i < 48; i++) {
@@ -1539,7 +1561,7 @@ async function refresh() {
     if (!response.ok) throw new Error("bad response");
     const snapshot = await response.json();
     $("lost").hidden = true;
-    if (!snapshot.devices) return;      // the first scan has not finished yet
+    if (!snapshot.devices) return;
     render(snapshot);
   } catch (error) {
     $("lost").hidden = false;
@@ -1554,7 +1576,6 @@ setInterval(refresh, 5000);
 
 
 def read_csv_tail(path, count):
-    """The last few rows of a CSV file, as dictionaries (empty if the file does not exist yet)."""
     try:
         with open(path, newline="", encoding="utf-8") as f:
             return list(csv.DictReader(f))[-count:]
@@ -1564,7 +1585,6 @@ def read_csv_tail(path, count):
 
 def publish_dashboard(known, nicknames, my_ip, network, router, round_number,
                       interval, internet, alerts_text, warnings, stats, since_ts, now_ts, approved, quality):
-    """Package the latest scan as JSON. The web page fetches this every few seconds."""
     devices = []
     for ip, d in known.items():
         if not d["online"]:
@@ -1613,8 +1633,6 @@ def publish_dashboard(known, nicknames, my_ip, network, router, round_number,
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    """Answers the browser: '/' gets the page, '/api/status' gets the latest numbers."""
-
     def do_GET(self):
         path = self.path.split("?")[0]
         if path == "/":
@@ -1632,18 +1650,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, *args):
-        pass    # keep the terminal table clean
+        pass
 
 
 class QuietServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def handle_error(self, request, client_address):
-        pass    # browsers close connections all the time, so no scary error messages
+        pass
 
 
 def start_dashboard(host, port):
-    """Start the web server in the background. Returns False if the port is already taken."""
     try:
         server = QuietServer((host, port), DashboardHandler)
     except OSError:
@@ -1670,6 +1687,13 @@ def main():
                         help="stranger alarm: go through devices one by one, or approve the given IPs")
     parser.add_argument("--unapprove", nargs="+", metavar="IP",
                         help="stranger alarm: take devices off the approved list")
+    parser.add_argument("--summary-now", action="store_true",
+                        help="show the weekly summary now (and send it to your phone), then stop")
+    parser.add_argument("--summary-day", type=str.lower, choices=SUMMARY_DAYS, default="sunday",
+                        help="day of the week for the weekly summary (default sunday)")
+    parser.add_argument("--summary-hour", type=int, default=20,
+                        help="hour of the day, 0 to 23, for the weekly summary (default 20)")
+    parser.add_argument("--no-summary", action="store_true", help="turn the weekly summary off")
     parser.add_argument("--quality-pings", type=int, default=10,
                         help="pings per connection quality test each scan (default 10, 0 turns it off)")
     parser.add_argument("--keep-days", type=int, default=30,
@@ -1680,8 +1704,14 @@ def main():
                         help="set up alerts.json and send a test message to your phone")
     args = parser.parse_args()
 
+    if not 0 <= args.summary_hour <= 23:
+        print("--summary-hour must be a number from 0 to 23.")
+        return
     if args.report:
         run_report()
+        return
+    if args.summary_now:
+        run_summary_now()
         return
     if args.approve is not None:
         run_approve(args.approve)
@@ -1708,9 +1738,9 @@ def main():
     network = ipaddress.ip_network(args.network) if args.network else detected_network
     router = args.router or find_router(network)
 
-    known = load_known()    # every device we have ever seen (also from earlier runs), keyed by IP address
+    known = load_known()
     alerter = Alerter()
-    outage = None       # None while the internet is fine; details while it is down
+    outage = None
     round_number = 0
 
     history = None
@@ -1722,13 +1752,14 @@ def main():
         history = None
         history_problem = "Warning: history.db could not be opened, so uptime history is off."
     last_prune = time.time()
-    alarm_times = {}    # when each unapproved device last set off the alarm, so we do not repeat ourselves
-    burst_pool = ThreadPoolExecutor(max_workers=2)   # runs the quality tests while the sweep is running
+    alarm_times = {}
+    burst_pool = ThreadPoolExecutor(max_workers=2)
+    watcher = QualityWatcher()
+    summary_day = SUMMARY_DAYS.index(args.summary_day)
 
     if args.no_dashboard or args.once:
         dashboard_text = "off"
     else:
-        # 127.0.0.1 means "only this computer". 0.0.0.0 means "anyone on the home network".
         host = "0.0.0.0" if args.share else "127.0.0.1"
         if not start_dashboard(host, args.port):
             dashboard_text = f"could not start (port {args.port} is busy, try --port {args.port + 1})"
@@ -1741,7 +1772,6 @@ def main():
         while True:
             round_number += 1
             baseline = round_number == 1
-            # Start the connection quality tests first. They run at the same time as the sweep.
             bursts = {}
             if args.quality_pings > 0:
                 bursts = {INTERNET_KEY: burst_pool.submit(ping_burst, INTERNET_TARGETS[0], args.quality_pings),
@@ -1749,11 +1779,10 @@ def main():
             results = sweep(network)
             quality = {key: future.result() for key, future in bursts.items()}
             arp_table = read_arp_table()
-            nicknames, nickname_problem = load_nicknames()   # re-read each scan, so edits apply live
+            nicknames, nickname_problem = load_nicknames()
             alerter.reload()
-            approved, approved_problem = load_approved()    # re-read each scan, so approvals apply live
+            approved, approved_problem = load_approved()
 
-            # 1. Is the internet working? If not, is it our home or the provider?
             internet_up, internet_ms = check_internet()
             router_ok = True
             if not internet_up:
@@ -1766,8 +1795,6 @@ def main():
                     cause = "home network (router not answering)"
                 outage = {"start": datetime.now(), "cause": cause}
                 log_event("internet", "down", cause)
-                # No alert yet: we cannot phone out while the internet is down.
-                # A message goes out when it comes back.
 
             elif internet_up and outage is not None:
                 end = datetime.now()
@@ -1779,16 +1806,12 @@ def main():
                               f"Likely cause: {outage['cause']}.")
                 outage = None
 
-            # 2. Update the device list. If the internet is down AND the router is silent,
-            #    this computer has probably lost its connection (or the power is out), so
-            #    the scan is unreliable. We skip it rather than call every device "left".
             trusted = internet_up or router_ok
             if trusted:
                 update_devices(known, results, arp_table, nicknames, my_ip,
                                args.misses, alerter, baseline, approved, alarm_times)
+            watcher.update(quality, internet_up, trusted, alerter)
 
-            # Save this scan for the history. If the scan was not trusted (see above), we still
-            # save the internet result, but not the devices, so they are not counted as down.
             now_ts = int(time.time())
             if history is not None:
                 history_problem = (record_history(history, now_ts, known, internet_up, internet_ms, trusted)
@@ -1799,8 +1822,13 @@ def main():
                     except sqlite3.Error:
                         pass
                     last_prune = time.time()
+                if not args.no_summary:
+                    try:
+                        check_weekly_summary(history, known, nicknames, my_ip, alerter,
+                                             summary_day, args.summary_hour, now_ts)
+                    except sqlite3.Error:
+                        pass
 
-            # 3. Send any waiting alerts (only works while the internet is up).
             alerter.flush(internet_up)
 
             if outage:
