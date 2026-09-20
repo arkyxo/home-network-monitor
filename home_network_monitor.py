@@ -4,9 +4,11 @@ import ipaddress
 import json
 import os
 import platform
+import random
 import re
 import socket
 import sqlite3
+import struct
 import subprocess
 import threading
 import time
@@ -29,6 +31,10 @@ ALARM_COOLDOWN = 6 * 3600
 
 INTERNET_KEY = "__internet__"
 ROUTER_KEY = "__router__"
+DNS_SYSTEM_KEY = "__dns_system__"
+DNS_PUBLIC_KEY = "__dns_public__"
+DNS_NAMES = ["google.com", "cloudflare.com", "wikipedia.org", "microsoft.com"]
+PUBLIC_DNS = ["8.8.8.8", "1.1.1.1"]
 SUMMARY_DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 BUCKET_SECONDS = 1800
 BUCKET_COUNT = 48
@@ -230,6 +236,173 @@ class QualityWatcher:
                 else:
                     hint = "Your router looks fine, so the problem is probably your internet provider."
                 alerter.queue(f"Poor connection to {name}: {detail} over the last few minutes. {hint}")
+
+
+def dns_query(server, name, timeout=2.0, port=53):
+    ident = random.randint(0, 65535)
+    header = struct.pack(">HHHHHH", ident, 0x0100, 1, 0, 0, 0)
+    question = b"".join(bytes([len(part)]) + part.encode("ascii") for part in name.split("."))
+    question += b"\x00" + struct.pack(">HH", 1, 1)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    started = time.perf_counter()
+    try:
+        sock.sendto(header + question, (server, port))
+        while True:
+            data, _ = sock.recvfrom(1024)
+            if len(data) >= 12 and struct.unpack(">H", data[:2])[0] == ident:
+                break
+    except (socket.timeout, OSError):
+        return False, None
+    finally:
+        sock.close()
+    milliseconds = (time.perf_counter() - started) * 1000
+    flags = struct.unpack(">H", data[2:4])[0]
+    answers = struct.unpack(">H", data[6:8])[0]
+    return (flags & 0x000F) == 0 and answers > 0, milliseconds
+
+
+def dns_check(server, name):
+    system = dns_query(server, name)
+    public, public_server = (False, None), PUBLIC_DNS[0]
+    for candidate in PUBLIC_DNS:
+        public, public_server = dns_query(candidate, name), candidate
+        if public[0]:
+            break
+    return {"system": system, "public": public, "public_server": public_server, "name": name}
+
+
+def parse_dns_server(text, my_ip, windows):
+    if not windows:
+        match = re.search(r"^nameserver\s+(\d+\.\d+\.\d+\.\d+)", text, re.MULTILINE)
+        return match.group(1) if match else None
+
+    blocks, current = [], []
+    for line in text.splitlines():
+        if line and not line[0].isspace() and line.rstrip().endswith(":"):
+            blocks.append("\n".join(current))
+            current = []
+        current.append(line)
+    blocks.append("\n".join(current))
+    ordered = [b for b in blocks if my_ip and my_ip in b] + [b for b in blocks if not (my_ip and my_ip in b)]
+    for block in ordered:
+        index = block.find("DNS Servers")
+        if index >= 0:
+            match = re.search(r"(\d+\.\d+\.\d+\.\d+)", block[index:index + 400])
+            if match:
+                return match.group(1)
+    return None
+
+
+def find_dns_server(my_ip, fallback):
+    try:
+        if IS_WINDOWS:
+            text = subprocess.run(["ipconfig", "/all"], capture_output=True, text=True, timeout=10).stdout
+        else:
+            with open("/etc/resolv.conf", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+    except (OSError, subprocess.TimeoutExpired):
+        return fallback
+    return parse_dns_server(text, my_ip, IS_WINDOWS) or fallback
+
+
+class DNSWatcher:
+    WINDOW = 6
+    FAILS_TO_ALERT = 3
+    OK_TO_RECOVER = 2
+    SLOW_MS = 200
+    COOLDOWN = 1800
+
+    def __init__(self, server):
+        self.server = server
+        self.system = deque(maxlen=self.WINDOW)
+        self.public = deque(maxlen=self.WINDOW)
+        self.latest = None
+        self.fail_streak = 0
+        self.ok_streak = 0
+        self.alerted_since = None
+        self.last_alert = 0
+
+    def update(self, result, internet_up, trusted, alerter):
+        if result is None or not internet_up or not trusted:
+            self.system.clear()
+            self.public.clear()
+            self.fail_streak = 0
+            self.ok_streak = 0
+            self.latest = None
+            return
+        self.latest = result
+        system_ok = result["system"][0]
+        public_ok = result["public"][0]
+        self.system.append(result["system"])
+        self.public.append(result["public"])
+        if system_ok:
+            self.fail_streak, self.ok_streak = 0, self.ok_streak + 1
+        else:
+            self.fail_streak, self.ok_streak = self.fail_streak + 1, 0
+
+        if self.alerted_since is not None:
+            if self.ok_streak >= self.OK_TO_RECOVER:
+                seconds = (datetime.now() - self.alerted_since).total_seconds()
+                self.alerted_since = None
+                log_event("dns", "recovered", "your DNS server answers again")
+                alerter.queue(f"DNS is working again after {format_duration(seconds)}.")
+        elif self.fail_streak >= self.FAILS_TO_ALERT and time.time() - self.last_alert > self.COOLDOWN:
+            self.alerted_since = datetime.now()
+            self.last_alert = time.time()
+            if public_ok:
+                detail = f"your DNS server {self.server} is not answering, but public DNS works"
+                message = (f"DNS problem: {detail}. Websites may not load even though the internet is up. "
+                           f"A fix is to switch your DNS to {PUBLIC_DNS[0]} or {PUBLIC_DNS[1]} "
+                           f"in your router or computer settings.")
+            else:
+                detail = "DNS lookups are failing everywhere while the internet is up"
+                message = f"DNS problem: {detail}. Something may be blocking DNS traffic."
+            log_event("dns", "poor", detail)
+            alerter.queue(message)
+
+    def average(self, window):
+        values = [ms for ok, ms in window if ok and ms is not None]
+        return sum(values) / len(values) if values else None
+
+    def snapshot(self):
+        info = {"enabled": True, "server": self.server, "status": "unknown", "system_ms": None,
+                "public_ms": None, "public_server": PUBLIC_DNS[0],
+                "note": "Not measured right now (waiting for the internet)."}
+        if self.latest is None:
+            return info
+        system_ok, system_ms = self.latest["system"]
+        public_ok, public_ms = self.latest["public"]
+        info["public_server"] = self.latest["public_server"]
+        info["system_ms"] = round(system_ms, 1) if system_ok and system_ms is not None else None
+        info["public_ms"] = round(public_ms, 1) if public_ok and public_ms is not None else None
+        average_system, average_public = self.average(self.system), self.average(self.public)
+
+        if self.fail_streak >= self.FAILS_TO_ALERT:
+            info["status"] = "failing"
+            info["note"] = (f"Your DNS server ({self.server}) is not answering, but public DNS works. "
+                            "Websites may not load." if public_ok
+                            else "DNS lookups are failing everywhere.")
+        elif not system_ok:
+            info["status"] = "unknown"
+            info["note"] = "The last lookup got no answer. Checking again."
+        elif average_system is not None and average_system > self.SLOW_MS \
+                and (average_public is None or average_system > 3 * average_public):
+            info["status"] = "slow"
+            info["note"] = (f"Your DNS server ({self.server}) is slow: about {average_system:.0f} ms"
+                            + (f", while public DNS answers in about {average_public:.0f} ms. "
+                               "Switching DNS could make browsing feel faster." if average_public else "."))
+        else:
+            info["status"] = "ok"
+            extra = f", public DNS {public_ms:.0f} ms" if public_ok and public_ms is not None else ""
+            info["note"] = f"{system_ms:.0f} ms from {self.server}{extra}"
+        return info
+
+
+def dns_text_for(info):
+    if not info.get("enabled"):
+        return "off (remove --no-dns to turn it on)"
+    return f"{info['status'].upper()}. {info['note']}"
 
 
 def normalize_mac(raw):
@@ -660,7 +833,7 @@ def update_devices(known, results, arp_table, nicknames, my_ip, miss_limit, aler
 
 
 def show_table(known, my_ip, network, round_number, nicknames, warnings,
-               internet_text, router, alerts_text, dashboard_text, approved, quality_text):
+               internet_text, router, alerts_text, dashboard_text, approved, quality_text, dns_text):
     os.system("cls" if IS_WINDOWS else "clear")
     online_count = sum(1 for d in known.values() if d["online"])
     width = 98
@@ -669,6 +842,7 @@ def show_table(known, my_ip, network, round_number, nicknames, warnings,
           f"online: {online_count}   ever seen: {len(known)}")
     print(f"Internet: {internet_text}")
     print(f"Quality: {quality_text}")
+    print(f"DNS: {dns_text}")
     print(f"Alerts: {alerts_text}")
     if approved is None:
         print("Stranger alarm: off (run  python home_network_monitor.py --approve  to turn it on)")
@@ -719,7 +893,7 @@ def device_key(ip, entry):
     return entry.get("mac") or ip
 
 
-def record_history(conn, ts, known, internet_up, internet_ms, save_devices):
+def record_history(conn, ts, known, internet_up, internet_ms, save_devices, dns_rows=None):
     try:
         rows = [(ts, INTERNET_KEY, 1 if internet_up else 0, internet_ms)]
         if save_devices:
@@ -731,6 +905,8 @@ def record_history(conn, ts, known, internet_up, internet_ms, save_devices):
                 if key not in by_key or online > by_key[key][0]:
                     by_key[key] = (online, ms)
             rows += [(ts, key, online, ms) for key, (online, ms) in by_key.items()]
+        if dns_rows:
+            rows += [(ts, key, 1 if ok else 0, ms) for key, ok, ms in dns_rows]
         conn.executemany("INSERT INTO samples VALUES (?, ?, ?, ?)", rows)
         conn.commit()
         return ""
@@ -893,6 +1069,9 @@ def run_report():
     print("-" * 88)
 
     rows = [("Internet", "-", stats.get(INTERNET_KEY))]
+    for label, key in (("DNS lookups", DNS_SYSTEM_KEY), ("Public DNS", DNS_PUBLIC_KEY)):
+        if key in stats:
+            rows.append((label, "-", stats[key]))
     seen = set()
     for ip in sorted(known, key=sort_key):
         d = known[ip]
@@ -1003,6 +1182,10 @@ def build_summary(conn, known, nicknames, my_ip, now_ts):
             jitter = "-" if q["jitter"] is None else f"{q['jitter']:.0f} ms"
             ping = "-" if q["avg_ms"] is None else f"{q['avg_ms']:.0f} ms"
             lines.append(f"{name} quality: {q['loss']:.1f}% of test pings lost, jitter {jitter}, average ping {ping}")
+
+    dns = stats.get(DNS_SYSTEM_KEY)
+    if dns and dns["uptime_7d"] is not None:
+        lines.append(f"DNS: {pct(dns['uptime_7d'])} of lookups answered")
 
     lines += ["", "Devices (uptime this week):"]
     rows, seen = [], set()
@@ -1182,11 +1365,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="note-text" id="stat-total"></div></div>
     <div class="card"><div class="label">Internet</div><div class="value" id="stat-internet">-</div>
       <div class="note-text" id="stat-internet-note"></div></div>
+    <div class="card"><div class="label">DNS</div><div class="value small" id="stat-dns">-</div>
+      <div class="note-text" id="stat-dns-note"></div></div>
     <div class="card"><div class="label">Connection quality</div><div class="value small" id="stat-quality">-</div>
       <div class="note-text" id="stat-quality-note"></div></div>
     <div class="card"><div class="label">Stranger alarm</div><div class="value small" id="stat-stranger">-</div>
       <div class="note-text" id="stat-stranger-note"></div></div>
-    <div class="card"><div class="label">Phone alerts</div><div class="value small" id="stat-alerts">-</div></div>
   </section>
 
   <section class="panel">
@@ -1286,6 +1470,9 @@ function renderDevices(list) {
 }
 
 function eventText(e) {
+  if (e.ip === "dns") {
+    return e.event === "poor" ? "DNS problem (" + e.name + ")" : "DNS is working again (" + e.name + ")";
+  }
   if (e.ip === "internet" || e.ip === "router") {
     const what = e.ip === "internet" ? "the internet" : "the router";
     if (e.event === "down") return "Internet went down (" + e.name + ")";
@@ -1378,11 +1565,12 @@ function sparkline(h, emptyText) {
   return svg;
 }
 
-function statsBlock(h) {
+function statsBlock(h, words) {
+  const w = words || { up: "Uptime", ms: "Ping" };
   const box = el("div", null, "hstats");
   if (!h) { box.appendChild(el("div", "No history yet")); return box; }
-  box.appendChild(el("div", "Uptime  24h " + pct(h.uptime_24h) + "   7d " + pct(h.uptime_7d)));
-  box.appendChild(el("div", "Ping  avg " + msText(h.avg_ms) + "   max " + msText(h.max_ms)));
+  box.appendChild(el("div", w.up + "  24h " + pct(h.uptime_24h) + "   7d " + pct(h.uptime_7d)));
+  box.appendChild(el("div", w.ms + "  avg " + msText(h.avg_ms) + "   max " + msText(h.max_ms)));
   return box;
 }
 
@@ -1394,7 +1582,7 @@ function historyRow(r, nowTs) {
   row.appendChild(who);
   row.appendChild(strip(r.h, nowTs));
   row.appendChild(sparkline(r.h));
-  row.appendChild(statsBlock(r.h));
+  row.appendChild(statsBlock(r.h, r.words));
   return row;
 }
 
@@ -1402,6 +1590,11 @@ function renderHistory(s) {
   const box = $("history");
   clear(box);
   box.appendChild(historyRow({ title: "Internet", sub: "8.8.8.8 and 1.1.1.1", h: s.internet_history }, s.now_ts));
+  if (s.dns && s.dns.enabled) {
+    const words = { up: "Answered", ms: "Lookup" };
+    box.appendChild(historyRow({ title: "DNS lookups", sub: s.dns.server, h: s.dns_history.system, words: words }, s.now_ts));
+    box.appendChild(historyRow({ title: "Public DNS", sub: s.dns.public_server, h: s.dns_history.public, words: words }, s.now_ts));
+  }
   s.devices.forEach((d) => {
     box.appendChild(historyRow({
       title: d.nickname || d.ip,
@@ -1499,8 +1692,25 @@ function renderQuality(s) {
   }
 }
 
+function renderDns(s) {
+  const card = $("stat-dns");
+  const note = $("stat-dns-note");
+  const dns = s.dns;
+  if (!dns || !dns.enabled) {
+    card.textContent = "Off";
+    card.className = "value small";
+    note.textContent = "Remove --no-dns to turn it on";
+    return;
+  }
+  const labels = { ok: "OK", slow: "Slow", failing: "Failing", unknown: "Checking..." };
+  const colors = { ok: "t-good", slow: "t-warn", failing: "t-bad", unknown: "" };
+  card.textContent = labels[dns.status] || "Checking...";
+  card.className = "value small " + (colors[dns.status] || "");
+  note.textContent = dns.note;
+}
+
 function render(s) {
-  $("network").textContent = "Network " + s.network + "  |  router " + s.router + "  |  this PC " + s.my_ip;
+  $("network").textContent = "Network " + s.network + "  |  router " + s.router + "  |  this PC " + s.my_ip + "  |  alerts: " + s.alerts;
   $("updated").textContent = "Updated " + s.updated + " (scan #" + s.scan + ", every " + s.interval + " s)";
 
   const online = s.devices.filter((d) => d.status !== "offline").length;
@@ -1537,7 +1747,6 @@ function render(s) {
     $("stat-stranger-note").textContent = "See the devices table";
   }
 
-  $("stat-alerts").textContent = s.alerts;
 
   const warnings = $("warnings");
   clear(warnings);
@@ -1552,6 +1761,7 @@ function render(s) {
   renderEvents(s.events);
   renderOutages(s.outages);
   renderQuality(s);
+  renderDns(s);
   renderHistory(s);
 }
 
@@ -1584,7 +1794,7 @@ def read_csv_tail(path, count):
 
 
 def publish_dashboard(known, nicknames, my_ip, network, router, round_number,
-                      interval, internet, alerts_text, warnings, stats, since_ts, now_ts, approved, quality):
+                      interval, internet, alerts_text, warnings, stats, since_ts, now_ts, approved, quality, dns):
     devices = []
     for ip, d in known.items():
         if not d["online"]:
@@ -1625,6 +1835,8 @@ def publish_dashboard(known, nicknames, my_ip, network, router, round_number,
         "history_since": datetime.fromtimestamp(since_ts).strftime("%Y-%m-%d %H:%M:%S") if since_ts else None,
         "internet_history": stats.get(INTERNET_KEY),
         "quality": quality,
+        "dns": dns,
+        "dns_history": {"system": stats.get(DNS_SYSTEM_KEY), "public": stats.get(DNS_PUBLIC_KEY)},
         "stranger": {"active": approved is not None,
                      "approved_count": len(approved) if approved is not None else 0,
                      "unknown_online": unknown_online},
@@ -1687,6 +1899,9 @@ def main():
                         help="stranger alarm: go through devices one by one, or approve the given IPs")
     parser.add_argument("--unapprove", nargs="+", metavar="IP",
                         help="stranger alarm: take devices off the approved list")
+    parser.add_argument("--dns-server", metavar="IP",
+                        help="the DNS server to test (detected automatically if left out)")
+    parser.add_argument("--no-dns", action="store_true", help="turn the DNS check off")
     parser.add_argument("--summary-now", action="store_true",
                         help="show the weekly summary now (and send it to your phone), then stop")
     parser.add_argument("--summary-day", type=str.lower, choices=SUMMARY_DAYS, default="sunday",
@@ -1753,8 +1968,11 @@ def main():
         history_problem = "Warning: history.db could not be opened, so uptime history is off."
     last_prune = time.time()
     alarm_times = {}
-    burst_pool = ThreadPoolExecutor(max_workers=2)
+    burst_pool = ThreadPoolExecutor(max_workers=3)
     watcher = QualityWatcher()
+    dns_enabled = not args.no_dns
+    dns_server = args.dns_server or find_dns_server(my_ip, router)
+    dns_watcher = DNSWatcher(dns_server)
     summary_day = SUMMARY_DAYS.index(args.summary_day)
 
     if args.no_dashboard or args.once:
@@ -1776,8 +1994,12 @@ def main():
             if args.quality_pings > 0:
                 bursts = {INTERNET_KEY: burst_pool.submit(ping_burst, INTERNET_TARGETS[0], args.quality_pings),
                           ROUTER_KEY: burst_pool.submit(ping_burst, router, args.quality_pings)}
+            dns_future = None
+            if dns_enabled:
+                dns_future = burst_pool.submit(dns_check, dns_server, DNS_NAMES[round_number % len(DNS_NAMES)])
             results = sweep(network)
             quality = {key: future.result() for key, future in bursts.items()}
+            dns_result = dns_future.result() if dns_future else None
             arp_table = read_arp_table()
             nicknames, nickname_problem = load_nicknames()
             alerter.reload()
@@ -1811,10 +2033,17 @@ def main():
                 update_devices(known, results, arp_table, nicknames, my_ip,
                                args.misses, alerter, baseline, approved, alarm_times)
             watcher.update(quality, internet_up, trusted, alerter)
+            if dns_enabled:
+                dns_watcher.update(dns_result, internet_up, trusted, alerter)
 
             now_ts = int(time.time())
             if history is not None:
-                history_problem = (record_history(history, now_ts, known, internet_up, internet_ms, trusted)
+                dns_rows = None
+                if dns_result and internet_up and trusted:
+                    dns_rows = [(key, ok, ms if ok else None)
+                                for key, (ok, ms) in ((DNS_SYSTEM_KEY, dns_result["system"]),
+                                                      (DNS_PUBLIC_KEY, dns_result["public"]))]
+                history_problem = (record_history(history, now_ts, known, internet_up, internet_ms, trusted, dns_rows)
                                    or record_quality(history, now_ts, quality))
                 if time.time() - last_prune > 86400:
                     try:
@@ -1865,15 +2094,17 @@ def main():
             else:
                 quality_text = "off (use --quality-pings 10 to turn it on)"
 
+            dns_snapshot = dns_watcher.snapshot() if dns_enabled else {"enabled": False}
             internet = {"up": internet_up, "ms": internet_ms,
                         "since": outage["start"].strftime("%H:%M:%S") if outage else None,
                         "cause": outage["cause"] if outage else None}
             publish_dashboard(known, nicknames, my_ip, network, router, round_number,
                               args.interval, internet, alerter.channels_text(), warnings,
-                              stats, since_ts, now_ts, approved, quality_snapshot)
+                              stats, since_ts, now_ts, approved, quality_snapshot, dns_snapshot)
 
             show_table(known, my_ip, network, round_number, nicknames, warnings,
-                       internet_text, router, alerter.channels_text(), dashboard_text, approved, quality_text)
+                       internet_text, router, alerter.channels_text(), dashboard_text, approved, quality_text,
+                       dns_text_for(dns_snapshot))
 
             with open(STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(known, f, indent=2)
